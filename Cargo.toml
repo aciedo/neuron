@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "router",
+    "client"
+]
+registry = "aciedo"
+
+[profile.release]
+# optimizations
+opt-level = 3
+
+[profile.dev]
+# debug info
+debug = 2
