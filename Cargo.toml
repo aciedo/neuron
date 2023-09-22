@@ -4,7 +4,6 @@ members = [
     "router",
     "client"
 ]
-registry = "aciedo"
 
 [profile.release]
 # optimizations
