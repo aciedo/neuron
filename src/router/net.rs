@@ -7,6 +7,32 @@ struct Endpoint {
     client_config: Arc<rustls::ClientConfig>,
 }
 
+pub enum ConnectingError {
+    EndpointStopping,
+    TooManyConnections,
+    InvalidDnsName(String),
+    InvalidRemoteAddress(SocketAddr),
+    NoDefaultClientConfig,
+    UnsupportedVersion,
+    VersionMismatch,
+    TransportError(Error),
+    ConnectionClosed(ConnectionClose),
+    ApplicationClosed(ApplicationClose),
+    Reset,
+    TimedOut,
+    LocallyClosed,
+}
+
+impl From<ConnectError> for ConnectingError {
+    use ConnectError as ce;
+    use ConnectionError as cte;
+    fn from(error: ConnectionError) -> Self {
+        match error 
+    }
+}
+
+
+
 impl Endpoint {
     /// Creates a new QUIC endpoint bound to the given socket address with the given TLS configuration.
     pub fn new(
