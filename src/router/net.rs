@@ -26,8 +26,22 @@ pub enum ConnectingError {
 impl From<ConnectError> for ConnectingError {
     use ConnectError as ce;
     use ConnectionError as cte;
-    fn from(error: ConnectionError) -> Self {
-        match error 
+    fn from(error: ConnectingError) -> Self {
+        match error {
+            EndpointStopping => return ce:self,
+            TooManyConnections => return ce:self,
+            InvalidDnsName(String) => return ce:self,
+            InvalidRemoteAddress(SocketAddr) => return ce:self,
+            NoDefaultClientConfig => return ce:self,
+            UnsupportedVersion => return ce:self,
+            VersionMismatch => return cte:self,
+            TransportError(Error) => return cte:self,
+            ConnectionClosed(ConnectionClose) => return cte:self,
+            ApplicationClosed(ApplicationClose) => return cte:self,,
+            Reset => return cte:self,
+            TimedOut => return cte:self,
+            LocallyClosed => return cte:self,
+        }
     }
 }
 
@@ -44,7 +58,7 @@ impl Endpoint {
         Ok(Endpoint { endpoint: quinn::Endpoint::server(server_config, socket_addr)?, client_config })
     }
     
-    pub fn connect(socket_addr: SocketAddr, server_name: &str) -> () {
+    pub fn connect(socket_addr: SocketAddr, server_name: &str) -> Result<(), ConnectingError> {
         
     }
 }
