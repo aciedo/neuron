@@ -1,14 +1,18 @@
-[workspace]
-resolver = "2"
-members = [
-    "router",
-    "client"
-]
+[package]
+name = "neuron"
+version = "0.1.0"
+edition = "2021"
+publish = ["aciedo"]
 
-[profile.release]
-# optimizations
-opt-level = 3
+[lib]
 
-[profile.dev]
-# debug info
-debug = 2
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+default = ["client", "router"]
+client = []
+router = []
+
+[dependencies]
+quinn = "0.10.2"
+rustls = "0.21.7"

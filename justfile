@@ -1,3 +1,3 @@
 publish:
     cargo publish -p client
-    cargo publish -p server
+    cargo publish -p router
