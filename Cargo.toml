@@ -15,4 +15,5 @@ router = []
 
 [dependencies]
 quinn = "0.10.2"
+quinn-proto = "0.10.5"
 rustls = "0.21.7"
