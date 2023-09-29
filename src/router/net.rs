@@ -2,10 +2,6 @@ use std::{io, net::SocketAddr, sync::Arc};
 
 use quinn::ConnectError;
 use quinn::ConnectError::{InvalidDnsName, InvalidRemoteAddress};
-use quinn::ConnectionError::{ApplicationClosed, ConnectionClosed, TransportError};
-use quinn_proto::transport_parameters as QError;
-use rustls::Error as RlsError;
-
 use quinn::{ApplicationClose, ConnectionClose, ConnectionError};
 use rustls::ServerConfig;
 
@@ -15,8 +11,6 @@ struct Endpoint {
 }
 
 pub enum ConnectingError {
-    RustlsError(rustls::Error),
-
     EndpointStopping,
     TooManyConnections,
     InvalidDnsName(String),
@@ -25,7 +19,7 @@ pub enum ConnectingError {
     UnsupportedVersion,
 
     VersionMismatch,
-    TransportError(RlsError),
+    TransportError(rustls::Error),
     ConnectionClosed(ConnectionClose),
     ApplicationClosed(ApplicationClose),
     Reset,
@@ -36,32 +30,32 @@ pub enum ConnectingError {
 impl From<ConnectError> for ConnectingError {
     fn from(error: ConnectError) -> Self {
         match error {
-            EndpointStopping => return ConnectingError::EndpointStopping,
-            TooManyConnections => return ConnectingError::TooManyConnections,
-            InvalidDnsName(String) => return ConnectingError::InvalidDnsName(String),
-            InvalidRemoteAddress(SocketAddr) => {
-                return ConnectingError::InvalidRemoteAddress(SocketAddr)
-            }
-            NoDefaultClientConfig => return ConnectingError::NoDefaultClientConfig,
-            UnsupportedVersion => return ConnectingError::UnsupportedVersion,
+            EndpointStopping => ConnectingError::EndpointStopping,
+            TooManyConnections => ConnectingError::TooManyConnections,
+            InvalidDnsName(string) => ConnectingError::InvalidDnsName(string),
+            InvalidRemoteAddress(socket_addr) => ConnectingError::InvalidRemoteAddress(socket_addr),
+            NoDefaultClientConfig => ConnectingError::NoDefaultClientConfig,
+            UnsupportedVersion => ConnectingError::UnsupportedVersion,
         }
     }
 }
 
 impl From<ConnectionError> for ConnectingError {
-    fn from(error: ConnectionError) -> Self {
-        match error {
-            VersionMismatch => return ConnectingError::VersionMismatch,
-            TransportError(Error) => return ConnectingError::TransportError(RlsError),
-            ConnectionClosed(ConnectionClose) => {
-                return ConnectingError::ConnectionClosed(ConnectionClose)
+    fn from(error_enum: ConnectionError) -> Self {
+        match error_enum {
+            ConnectionError::VersionMismatch => ConnectingError::VersionMismatch,
+            ConnectionError::TransportError(inner_error) => {
+                ConnectingError::TransportError(inner_error)
             }
-            ApplicationClosed(ApplicationClose) => {
-                return ConnectingError::ApplicationClosed(ApplicationClose)
+            ConnectionError::ConnectionClosed(connection_close) => {
+                ConnectingError::ConnectionClosed(connection_close)
             }
-            Reset => return ConnectingError::Reset,
-            TimedOut => return ConnectingError::TimedOut,
-            LocallyClosed => return ConnectingError::LocallyClosed,
+            ConnectionError::ApplicationClosed(application_close) => {
+                ConnectingError::ApplicationClosed(application_close)
+            }
+            ConnectionError::Reset => ConnectingError::Reset,
+            ConnectionError::TimedOut => ConnectingError::TimedOut,
+            ConnectionError::LocallyClosed => ConnectingError::LocallyClosed,
         }
     }
 }
