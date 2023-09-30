@@ -1,8 +1,7 @@
 use std::{io, net::SocketAddr, sync::Arc};
 
-use quinn::ConnectError;
-use quinn::ConnectError::{InvalidDnsName, InvalidRemoteAddress};
-use quinn::{ApplicationClose, ConnectionClose, ConnectionError};
+use quinn::{ConnectError, ConnectionError};
+use quinn_proto::{ApplicationClose, ConnectionClose, TransportError};
 use rustls::ServerConfig;
 
 struct Endpoint {
@@ -19,7 +18,7 @@ pub enum ConnectingError {
     UnsupportedVersion,
 
     VersionMismatch,
-    TransportError(rustls::Error),
+    TransportError(TransportError),
     ConnectionClosed(ConnectionClose),
     ApplicationClosed(ApplicationClose),
     Reset,
@@ -30,28 +29,28 @@ pub enum ConnectingError {
 impl From<ConnectError> for ConnectingError {
     fn from(error: ConnectError) -> Self {
         match error {
-            EndpointStopping => ConnectingError::EndpointStopping,
-            TooManyConnections => ConnectingError::TooManyConnections,
-            InvalidDnsName(string) => ConnectingError::InvalidDnsName(string),
-            InvalidRemoteAddress(socket_addr) => ConnectingError::InvalidRemoteAddress(socket_addr),
-            NoDefaultClientConfig => ConnectingError::NoDefaultClientConfig,
-            UnsupportedVersion => ConnectingError::UnsupportedVersion,
+            ConnectError::EndpointStopping => ConnectingError::EndpointStopping,
+            ConnectError::TooManyConnections => ConnectingError::TooManyConnections,
+            ConnectError::InvalidDnsName(name) => ConnectingError::InvalidDnsName(name),
+            ConnectError::InvalidRemoteAddress(socket_addr) => {
+                ConnectingError::InvalidRemoteAddress(socket_addr)
+            }
+            ConnectError::NoDefaultClientConfig => ConnectingError::NoDefaultClientConfig,
+            ConnectError::UnsupportedVersion => ConnectingError::UnsupportedVersion,
         }
     }
 }
 
 impl From<ConnectionError> for ConnectingError {
-    fn from(error_enum: ConnectionError) -> Self {
-        match error_enum {
+    fn from(error: ConnectionError) -> Self {
+        match error {
             ConnectionError::VersionMismatch => ConnectingError::VersionMismatch,
-            ConnectionError::TransportError(inner_error) => {
-                ConnectingError::TransportError(inner_error)
+            ConnectionError::TransportError(e) => ConnectingError::TransportError(e),
+            ConnectionError::ConnectionClosed(close_frame) => {
+                ConnectingError::ConnectionClosed(close_frame)
             }
-            ConnectionError::ConnectionClosed(connection_close) => {
-                ConnectingError::ConnectionClosed(connection_close)
-            }
-            ConnectionError::ApplicationClosed(application_close) => {
-                ConnectingError::ApplicationClosed(application_close)
+            ConnectionError::ApplicationClosed(close_frame) => {
+                ConnectingError::ApplicationClosed(close_frame)
             }
             ConnectionError::Reset => ConnectingError::Reset,
             ConnectionError::TimedOut => ConnectingError::TimedOut,
