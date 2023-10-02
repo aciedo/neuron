@@ -1,12 +1,10 @@
-use std::{io, net::SocketAddr, sync::Arc};
+use std::{io::{self, BufReader, Cursor}, net::SocketAddr, sync::Arc};
 
 use quinn::{ConnectError, ConnectionError, Connecting, default_runtime};
 use quinn_proto::{ApplicationClose, ConnectionClose, TransportError};
-use rustls::ServerConfig;
+use rustls::{ServerConfig, Certificate, internal::msgs::codec::Codec, PrivateKey, server::AllowAnyAuthenticatedClient};
 
-struct Endpoint {
-    ep: Arc<quinn::Endpoint>,
-}
+const SKI_ROOT_CA: &[u8] = include_bytes!("ski.crt");
 
 pub enum ConnectingError {
     EndpointStopping,
@@ -87,16 +85,22 @@ impl From<quinn::ReadToEndError> for ConnectingError {
     }
 }
 
+struct Endpoint {
+    ep: Arc<quinn::Endpoint>,
+}
+
 impl Endpoint {
     /// Creates a new QUIC endpoint bound to the given socket address with the given TLS configuration.
     pub fn new(
         socket_addr: SocketAddr,
-        server_tls: rustls::ServerConfig,
-        client_tls: Arc<rustls::ClientConfig>,
+        key: &[u8],
+        cert: &[u8],
     ) -> io::Result<Self> {
         let socket = std::net::UdpSocket::bind(socket_addr)?;
         let runtime = default_runtime()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no async runtime found"))?;
+        
+        let (client_tls, server_tls) = Self::tls_config(cert, key).unwrap();
         
         // shared transport configuration for the server and client sides
         // this is the default config with the BBR congestion controller enabled
@@ -108,7 +112,7 @@ impl Endpoint {
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(server_tls));
         server_config.transport_config(transport_config.clone());
         
-        let mut client_config = quinn::ClientConfig::new(client_tls);
+        let mut client_config = quinn::ClientConfig::new(Arc::new(client_tls));
         client_config.transport_config(transport_config);
         
         let config = quinn::EndpointConfig::default();
@@ -120,36 +124,74 @@ impl Endpoint {
         Ok(Endpoint { ep })
     }
 
-    /// Makes an outbound connection from this endpoint to another NEURON node.
+    /// Creates an outbound axon from this endpoint to another NEURON node.
     pub async fn connect(
         &self,
         addr: SocketAddr,
         server_name: &str,
         config: quinn::ServerConfig,
     ) -> Result<(), ConnectingError> {
-        let conn = self.ep.connect(addr, server_name)?.await?;
+        let axon = self.ep.connect(addr, server_name)?.await?;
+        // axons support multiple streams which are prioritized and handled asynchronously
+        // neuron maintains streams in this order of priority:
+        // 0. heartbeat stream (highest priority)
+        //    - responsible for sending and receiving heartbeat messages
+        //    - measure latency and assist axon quality and routing information
+        // 1. control stream
+        //    - responsible for neuron's network metadata
+        //    - such as new router information
+        // 2... dynamically created data streams (lowest priority)
+        //    - 
         Ok(())
     }
     
-    /// Accepts incoming connections and spawns tasks to handle them.
+    /// Accepts incoming axons and spawns tasks to handle them.
     /// This will run until the endpoint is shut down, so it should be spawned in a dedicated task.
     pub async fn acceptor(ep: Arc<quinn::Endpoint>) -> Result<(), ConnectingError> {
         while let Some(conn) = ep.accept().await {
-            tokio::spawn(async move {
-                if let Err(e) = Self::connection_handler(conn).await {
-                    println!("Connection failed: {:?}", e);
-                }
-            });
+            Axon::new(conn.await?);
         }
         Ok(())
     }
     
-    /// Handles an incoming connection.
-    pub async fn connection_handler(conn: Connecting) -> Result<(), ()> {
-        if let Ok(conn) = conn.await {
-            let conn_id = conn.stable_id();
-            // connections are bi-directional
-        }
-        Ok(())
+    /// Returns rustls configurations using SKI's root CA.
+    fn tls_config(cert: &[u8], key: &[u8]) -> Result<(rustls::ClientConfig, rustls::ServerConfig), rustls::Error> {
+        let root_ca = Certificate::read_bytes(SKI_ROOT_CA)?;
+        let mut root_certs = rustls::RootCertStore::empty();
+        root_certs.add(&root_ca)?;
+        let cert = Certificate::read_bytes(cert)?;
+        let key = {
+            let mut keys = rustls_pemfile::pkcs8_private_keys(&mut BufReader::new(Cursor::new(key))).unwrap();
+            if keys.len() != 1 {
+                panic!("expected exactly one private key");
+            }
+            keys.remove(0)
+        };
+        
+        let client_config = rustls::ClientConfig::builder()
+            .with_safe_defaults()
+            .with_root_certificates(root_certs.clone())
+            .with_client_auth_cert(vec![cert.clone()], PrivateKey(key.clone()))?;
+        
+        let client_cert_verifier = Arc::new(AllowAnyAuthenticatedClient::new(root_certs));
+        let server_config = rustls::ServerConfig::builder()
+            .with_safe_defaults()
+            .with_client_cert_verifier(client_cert_verifier)
+            .with_single_cert(vec![cert], PrivateKey(key))?;
+        
+        Ok((client_config, server_config))
+    }
+}
+
+/// Axons are QUIC backbone links that connect Aciedo's global infrastructure together.
+struct Axon(quinn::Connection);
+
+impl Axon {
+    fn new(conn: quinn::Connection) -> Self {
+        Axon(conn)
+    }
+    
+    fn id(&self) -> usize {
+        self.0.stable_id()
     }
 }
