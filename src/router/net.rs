@@ -24,6 +24,11 @@ pub enum ConnectingError {
     Reset,
     TimedOut,
     LocallyClosed,
+
+    Error,
+
+    WriteError,
+    ReadToEndError,
 }
 
 impl From<ConnectError> for ConnectingError {
@@ -59,6 +64,30 @@ impl From<ConnectionError> for ConnectingError {
     }
 }
 
+impl From<std::io::Error> for ConnectingError {
+    fn from(value: std::io::Error) -> Self {
+        match value {
+            Error => ConnectingError::Error,
+        }
+    }
+}
+
+impl From<quinn::WriteError> for ConnectingError {
+    fn from(value: quinn::WriteError) -> Self {
+        match value {
+            WriteError => ConnectingError::WriteError,
+        }
+    }
+}
+
+impl From<quinn::ReadToEndError> for ConnectingError {
+    fn from(value: quinn::ReadToEndError) -> Self {
+        match value {
+            ReadToEndError => ConnectingError::ReadToEndError,
+        }
+    }
+}
+
 impl Endpoint {
     /// Creates a new QUIC endpoint bound to the given socket address with the given TLS configuration.
     pub fn new(
@@ -73,7 +102,20 @@ impl Endpoint {
         })
     }
 
-    pub fn connect(socket_addr: SocketAddr, server_name: &str) -> Result<(), ConnectingError> {
-        todo!();
+    pub async fn connect(
+        socket_addr: SocketAddr,
+        _server_name: &str,
+        config: quinn::ServerConfig,
+    ) -> Result<(), ConnectingError> {
+        let endpoint = quinn::Endpoint::server(config, socket_addr)?;
+        while let Some(conn) = endpoint.accept().await {
+            let connection = conn.await?;
+            let (mut send, mut recv) = connection.open_bi().await?;
+            send.write_all(b"test").await?;
+            send.finish().await?;
+            let _recieved = recv.read_to_end(10).await?;
+        }
+
+        Ok(())
     }
 }
