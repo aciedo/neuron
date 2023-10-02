@@ -1,12 +1,11 @@
 use std::{io, net::SocketAddr, sync::Arc};
 
-use quinn::{ConnectError, ConnectionError};
+use quinn::{ConnectError, ConnectionError, Connecting, default_runtime};
 use quinn_proto::{ApplicationClose, ConnectionClose, TransportError};
 use rustls::ServerConfig;
 
 struct Endpoint {
-    endpoint: quinn::Endpoint,
-    client_config: Arc<rustls::ClientConfig>,
+    ep: Arc<quinn::Endpoint>,
 }
 
 pub enum ConnectingError {
@@ -91,31 +90,66 @@ impl From<quinn::ReadToEndError> for ConnectingError {
 impl Endpoint {
     /// Creates a new QUIC endpoint bound to the given socket address with the given TLS configuration.
     pub fn new(
-        tls: ServerConfig,
         socket_addr: SocketAddr,
-        client_config: Arc<rustls::ClientConfig>,
+        server_tls: rustls::ServerConfig,
+        client_tls: Arc<rustls::ClientConfig>,
     ) -> io::Result<Self> {
-        let server_config = quinn::ServerConfig::with_crypto(Arc::new(tls));
-        Ok(Endpoint {
-            endpoint: quinn::Endpoint::server(server_config, socket_addr)?,
-            client_config,
-        })
+        let socket = std::net::UdpSocket::bind(socket_addr)?;
+        let runtime = default_runtime()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no async runtime found"))?;
+        
+        // shared transport configuration for the server and client sides
+        // this is the default config with the BBR congestion controller enabled
+        let mut transport_config = quinn::TransportConfig::default();
+        let bbr_config = quinn::congestion::BbrConfig::default();
+        transport_config.congestion_controller_factory(Arc::new(bbr_config));
+        let transport_config = Arc::new(transport_config);
+        
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(server_tls));
+        server_config.transport_config(transport_config.clone());
+        
+        let mut client_config = quinn::ClientConfig::new(client_tls);
+        client_config.transport_config(transport_config);
+        
+        let config = quinn::EndpointConfig::default();
+        let mut ep = quinn::Endpoint::new(config, Some(server_config), socket, runtime)?;
+        ep.set_default_client_config(client_config);
+        
+        let ep = Arc::new(ep);
+        tokio::spawn(Self::acceptor(ep.clone()));
+        Ok(Endpoint { ep })
     }
 
+    /// Makes an outbound connection from this endpoint to another NEURON node.
     pub async fn connect(
-        socket_addr: SocketAddr,
-        _server_name: &str,
+        &self,
+        addr: SocketAddr,
+        server_name: &str,
         config: quinn::ServerConfig,
     ) -> Result<(), ConnectingError> {
-        let endpoint = quinn::Endpoint::server(config, socket_addr)?;
-        while let Some(conn) = endpoint.accept().await {
-            let connection = conn.await?;
-            let (mut send, mut recv) = connection.open_bi().await?;
-            send.write_all(b"test").await?;
-            send.finish().await?;
-            let _recieved = recv.read_to_end(10).await?;
+        let conn = self.ep.connect(addr, server_name)?.await?;
+        Ok(())
+    }
+    
+    /// Accepts incoming connections and spawns tasks to handle them.
+    /// This will run until the endpoint is shut down, so it should be spawned in a dedicated task.
+    pub async fn acceptor(ep: Arc<quinn::Endpoint>) -> Result<(), ConnectingError> {
+        while let Some(conn) = ep.accept().await {
+            tokio::spawn(async move {
+                if let Err(e) = Self::connection_handler(conn).await {
+                    println!("Connection failed: {:?}", e);
+                }
+            });
         }
-
+        Ok(())
+    }
+    
+    /// Handles an incoming connection.
+    pub async fn connection_handler(conn: Connecting) -> Result<(), ()> {
+        if let Ok(conn) = conn.await {
+            let conn_id = conn.stable_id();
+            // connections are bi-directional
+        }
         Ok(())
     }
 }
