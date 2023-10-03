@@ -1,15 +1,18 @@
 use std::{
     io::{self, BufReader, Cursor},
-    net::SocketAddr,
-    sync::Arc,
+    net::{SocketAddr, IpAddr, UdpSocket},
+    sync::Arc, time::Duration,
 };
 
-use quinn::{default_runtime, ConnectError, ConnectionError};
+use hashbrown::HashMap;
+use quinn::{default_runtime, ConnectError, Connecting, ConnectionError};
 use quinn_proto::{ApplicationClose, ConnectionClose, TransportError};
+use rkyv::{Archive, Deserialize, Serialize};
 use rustls::{
     internal::msgs::codec::Codec, server::AllowAnyAuthenticatedClient,
     Certificate, PrivateKey,
 };
+use tokio::{sync::RwLock, time::interval};
 
 const SKI_ROOT_CA: &[u8] = include_bytes!("ski.crt");
 
@@ -104,19 +107,22 @@ impl From<quinn::ReadToEndError> for ConnectingError {
     }
 }
 
+const NEURON_PORT: u16 = 471; // "NEURON" in ascii, summed
+
 struct Endpoint {
     ep: Arc<quinn::Endpoint>,
+    axons: Arc<RwLock<HashMap<usize, Axon>>>
 }
 
 impl Endpoint {
     /// Creates a new QUIC endpoint bound to the given socket address with the
     /// given TLS configuration.
     pub fn new(
-        socket_addr: SocketAddr,
+        ip_addr: IpAddr,
         key: &[u8],
         cert: &[u8],
     ) -> io::Result<Self> {
-        let socket = std::net::UdpSocket::bind(socket_addr)?;
+        let socket = UdpSocket::bind(ip_addr_to_socket_addr(ip_addr, NEURON_PORT))?;
         let runtime = default_runtime().ok_or_else(|| {
             io::Error::new(io::ErrorKind::Other, "no async runtime found")
         })?;
@@ -144,67 +150,77 @@ impl Endpoint {
 
         let ep = Arc::new(ep);
         tokio::spawn(Self::acceptor(ep.clone()));
-        Ok(Endpoint { ep })
+        Ok(Endpoint { 
+            ep,
+            axons: Arc::new(RwLock::new(HashMap::new()))
+        })
     }
 
-    /// Creates an outbound axon from this endpoint to another NEURON node.
-    pub async fn connect(
-        &self,
-        addr: SocketAddr,
-        server_name: &str,
-        config: quinn::ServerConfig,
-    ) -> Result<(), ConnectingError> {
-        let axon = self.ep.connect(addr, server_name)?.await?;
+    // /// Creates an outbound axon from this endpoint to another NEURON node.
+    // pub async fn connect(
+    //     &self,
+    //     addr: SocketAddr,
+    //     server_name: &str,
+    //     config: quinn::ServerConfig,
+    // ) -> Result<(), ConnectingError> {
+    //     let axon = self.ep.connect(addr, server_name)?.await?;
 
-        // heartbeat stream
-        // send is moved to a basic task that sends heartbeats at a regular
-        // interval receive is moved to a more advanced task that
-        // handles measuring all axons' quality which is responsible for
-        // triggering leader elections and optimising routing
-        let (hb_send, hb_receive) = axon.open_bi().await?;
-        // control streams manage higher level neuron metadata and routing info,
-        // such as a add/remove router, add/remove region, etc
-        // this control channel isn't generally very busy, so these two are
-        // handled in the same task
-        let (ctrl_send, ctrl_receive) = axon.open_bi().await?;
+    //     // heartbeat stream
+    //     // send is moved to a basic task that sends heartbeats at a regular
+    //     // interval receive is moved to a more advanced task that
+    //     // handles measuring all axons' quality which is responsible for
+    //     // triggering leader elections and optimising routing
+    //     let (hb_send, hb_receive) = axon.open_bi().await?;
+    //     // control streams manage higher level neuron metadata and routing info,
+    //     // such as a add/remove router, add/remove region, etc
+    //     // this control channel isn't generally very busy, so these two are
+    //     // handled in the same task
+    //     let (ctrl_send, ctrl_receive) = axon.open_bi().await?;
 
-        // axons support multiple {bi/uni}directional streams which are
-        // prioritized and handled asynchronously neuron maintains
-        // streams in this order of priority:
-        // 0. heartbeat stream (bi-directional)
-        //    - responsible for sending and receiving heartbeat messages
-        //    - measure latency and assist axon quality and routing information
-        // 1. control stream (bi-directional)
-        //    - responsible for neuron's network metadata
-        //    - such as new router information
-        // 2... dynamically created per-partition data streams (uni-directional
-        // due to number of partitions)
-        //    - responsible for handling writing and reading
-        //    - created dynamically as they are inexpensive to create and allow
-        //      for efficient parallelism
-        //    - may reach up to 65536 streams in total per axon
-        //    - each stream is assigned a partition
-        //    - each partition handler owns its own stream - it won't block
-        //      other partitions
-        //    - each partition has a pair of unidirectional channels for each
-        //      axon
-        //
-        Ok(())
-    }
+    //     // axons support multiple {bi/uni}directional streams which are
+    //     // prioritized and handled asynchronously neuron maintains
+    //     // streams in this order of priority:
+    //     // 0. heartbeat stream (bi-directional)
+    //     //    - responsible for sending and receiving heartbeat messages
+    //     //    - measure latency and assist axon quality and routing information
+    //     // 1. control stream (bi-directional)
+    //     //    - responsible for neuron's network metadata
+    //     //    - such as new router information
+    //     // 2... dynamically created per-partition data streams (uni-directional
+    //     // due to number of partitions)
+    //     //    - responsible for handling writing and reading
+    //     //    - created dynamically as they are inexpensive to create and allow
+    //     //      for efficient parallelism
+    //     //    - may reach up to 65536 streams in total per axon
+    //     //    - each stream is assigned a partition
+    //     //    - each partition handler owns its own stream - it won't block
+    //     //      other partitions
+    //     //    - each partition has a pair of unidirectional channels for each
+    //     //      axon
+    //     //
+    //     Ok(())
+    // }
 
     /// Accepts incoming axons and spawns tasks to handle them.
     /// This will run until the endpoint is shut down, so it should be spawned
     /// in a dedicated task.
-    pub async fn acceptor(
+    async fn acceptor(
         ep: Arc<quinn::Endpoint>,
     ) -> Result<(), ConnectingError> {
-        while let Some(conn) = ep.accept().await {
-            Axon::new(conn.await?);
+        while let Some(in_progress) = ep.accept().await {
+            tokio::spawn(Axon::new(in_progress));
         }
+        Ok(())
+    }
+    
+    pub async fn connect(&self, remote: SocketAddr, remote_name: &str) -> Result<(), ConnectingError> {
+        let axon = Axon::new(self.ep.connect(remote, remote_name)?).await?;
+        self.axons.write().await.insert(axon.id(), axon);
         Ok(())
     }
 
     /// Returns rustls configurations using SKI's root CA.
+    /// Both client and server validate each other using the root CA.
     fn tls_config(
         cert: &[u8],
         key: &[u8],
@@ -237,6 +253,10 @@ impl Endpoint {
         let server_config = rustls::ServerConfig::builder()
             .with_safe_defaults()
             .with_client_cert_verifier(
+                // TODO: use a custom verifier that checks the client's
+                // certificate against the root CA, including host name, role
+                // checks etc ensure that the client is an
+                // actual neuron router
                 AllowAnyAuthenticatedClient::new(root_certs).boxed(),
             )
             .with_single_cert(vec![cert], PrivateKey(key))?;
@@ -245,16 +265,56 @@ impl Endpoint {
     }
 }
 
+fn ip_addr_to_socket_addr(ip: IpAddr, port: u16) -> SocketAddr {
+    match ip {
+        IpAddr::V4(ip) => SocketAddr::from((ip, port)),
+        IpAddr::V6(ip) => SocketAddr::from((ip, port)),
+    }
+}
+
 /// Axons are QUIC backbone links that connect Aciedo's global infrastructure
 /// together.
-struct Axon(quinn::Connection);
+struct Axon {
+    conn: quinn::Connection,
+    local_addr: SocketAddr,
+    remote_addr: SocketAddr,
+}
 
 impl Axon {
-    fn new(conn: quinn::Connection) -> Self {
-        Axon(conn)
+    /// Creates an axon using an in-progress connection.
+    async fn new(in_progress: Connecting) -> Result<Self, ConnectingError> {
+        let remote_addr = in_progress.remote_address();
+        let local_ip = in_progress.local_ip().expect("local IP address missing");
+        let axon = Axon { 
+            conn: in_progress.await?,
+            local_addr: ip_addr_to_socket_addr(local_ip, NEURON_PORT),
+            remote_addr,
+        };
+        axon.setup_heart().await?;
+        Ok(axon)
     }
 
     fn id(&self) -> usize {
-        self.0.stable_id()
+        self.conn.stable_id()
+    }
+    
+    async fn setup_heart(&self) -> Result<(), ConnectingError> {
+        // heartbeats aren't very useful 
+        let (mut hb_send, hb_receive) = self.conn.open_bi().await?;
+        tokio::spawn(async move {
+            let mut interval = interval(Duration::from_millis(10));
+            loop {
+                interval.tick().await;
+                hb_send.write(&[1]).await.unwrap();
+            }
+        });
+        Ok(())
     }
 }
+
+
+struct AxonController {}
+
+struct PartitionStreamController {}
+
+struct AxonPartitionController {}

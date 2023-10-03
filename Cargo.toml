@@ -14,8 +14,10 @@ client = []
 router = []
 
 [dependencies]
+hashbrown = { version = "0.14.1", features = ["rkyv", "nightly"] }
 quinn = "0.10.2"
 quinn-proto = "0.10.5"
+rkyv = { version = "0.7.42", features = ["copy", "validation"] }
 rustls = "0.21.7"
 rustls-pemfile = "1.0.3"
 tokio = { version = "1.32.0", features = ["full"] }
