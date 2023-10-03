@@ -1,8 +1,8 @@
 use std::{io::{self, BufReader, Cursor}, net::SocketAddr, sync::Arc};
 
-use quinn::{ConnectError, ConnectionError, Connecting, default_runtime};
+use quinn::{ConnectError, ConnectionError, default_runtime};
 use quinn_proto::{ApplicationClose, ConnectionClose, TransportError};
-use rustls::{ServerConfig, Certificate, internal::msgs::codec::Codec, PrivateKey, server::AllowAnyAuthenticatedClient};
+use rustls::{Certificate, internal::msgs::codec::Codec, PrivateKey, server::AllowAnyAuthenticatedClient};
 
 const SKI_ROOT_CA: &[u8] = include_bytes!("ski.crt");
 
@@ -132,6 +132,10 @@ impl Endpoint {
         config: quinn::ServerConfig,
     ) -> Result<(), ConnectingError> {
         let axon = self.ep.connect(addr, server_name)?.await?;
+        
+        // heartbeat stream
+        let (send, receive) = axon.open_bi().await?;
+        
         // axons support multiple streams which are prioritized and handled asynchronously
         // neuron maintains streams in this order of priority:
         // 0. heartbeat stream (highest priority)
@@ -140,8 +144,10 @@ impl Endpoint {
         // 1. control stream
         //    - responsible for neuron's network metadata
         //    - such as new router information
-        // 2... dynamically created data streams (lowest priority)
-        //    - 
+        // 2... dynamically created per-partition data streams (lowest priority)
+        //    - responsible for sending application data
+        //    - created dynamically as they are inexpensive to create
+        //      and allow for efficient parallelism
         Ok(())
     }
     
@@ -159,6 +165,7 @@ impl Endpoint {
         let root_ca = Certificate::read_bytes(SKI_ROOT_CA)?;
         let mut root_certs = rustls::RootCertStore::empty();
         root_certs.add(&root_ca)?;
+        
         let cert = Certificate::read_bytes(cert)?;
         let key = {
             let mut keys = rustls_pemfile::pkcs8_private_keys(&mut BufReader::new(Cursor::new(key))).unwrap();
@@ -173,10 +180,9 @@ impl Endpoint {
             .with_root_certificates(root_certs.clone())
             .with_client_auth_cert(vec![cert.clone()], PrivateKey(key.clone()))?;
         
-        let client_cert_verifier = Arc::new(AllowAnyAuthenticatedClient::new(root_certs));
         let server_config = rustls::ServerConfig::builder()
             .with_safe_defaults()
-            .with_client_cert_verifier(client_cert_verifier)
+            .with_client_cert_verifier(AllowAnyAuthenticatedClient::new(root_certs).boxed())
             .with_single_cert(vec![cert], PrivateKey(key))?;
         
         Ok((client_config, server_config))
