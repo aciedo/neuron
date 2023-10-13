@@ -16,6 +16,7 @@ pub enum Error {
     ReceivedBadControlMessage(ControlMessage),
     PeerSignatureDidNotMatchChallengeGiven,
     PeerCertNotSignedByCA,
+    PeerCertDoesNotIncludeTheirAddr,
     CouldNotDecodeMessage,
     MessageLengthOverflowed,
 }

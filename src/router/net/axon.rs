@@ -77,6 +77,10 @@ impl Axon {
                 Err(PeerSignatureDidNotMatchChallengeGiven)?
             }
 
+            if !peer_identity.cert.includes_socket_addr(&remote_addr) {
+                Err(PeerCertDoesNotIncludeTheirAddr)?
+            }
+
             debug!("peer's certificate is valid");
 
             let our_sig = id_service.sign_challenge(challenge_for_me);

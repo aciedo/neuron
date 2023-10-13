@@ -252,20 +252,7 @@ impl Endpoint {
                     }
                 }
                 Some(error) = error_rx.recv() => {
-                    match error {
-                        Error::ConnectError(_) => todo!(),
-                        Error::ConnectionError(_) => todo!(),
-                        Error::Io(_) => todo!(),
-                        Error::WriteError(_) => todo!(),
-                        Error::ReadExactError(_) => todo!(),
-                        Error::ReadToEndError(_) => todo!(),
-                        Error::ReceivedBadHandshakeMessage(_) => todo!(),
-                        Error::ReceivedBadControlMessage(_) => todo!(),
-                        Error::PeerSignatureDidNotMatchChallengeGiven => todo!(),
-                        Error::PeerCertNotSignedByCA => todo!(),
-                        Error::CouldNotDecodeMessage => todo!(),
-                        Error::MessageLengthOverflowed => todo!(),
-                    }
+
                 }
             }
         }

@@ -9,13 +9,14 @@
 // encryption protocol using SKI inside KT2 will replace this hybrid system in
 // the future.
 
+use hashbrown::{HashMap, HashSet};
 use kt2::{PublicKey, SecretKey, Signature};
 use rkyv::{to_bytes, Archive, Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 
 pub type ServiceID = [u8; 32];
 
-use std::fmt;
+use std::{fmt, net::SocketAddr};
 
 pub struct HexSlice<'a>(&'a [u8]);
 
@@ -111,7 +112,7 @@ pub struct Certificate {
     /// A list of hosts that this certificate is valid for with optional ports.
     /// If a port isn't given, this certificate is valid for all ports on that
     /// host.
-    pub hosts: Vec<(Host, Vec<Option<u16>>)>,
+    pub hosts: HashMap<Host, HashSet<u16>>,
     /// The human readable name of the certificate.
     pub human_readable_name: String,
     /// A digest of the certificate's public key.
@@ -142,6 +143,18 @@ impl Certificate {
 
         self.public_key.verify(&cert, &certificate.signature)
     }
+
+    pub fn includes_socket_addr(&self, addr: &SocketAddr) -> bool {
+        let host = match addr {
+            SocketAddr::V4(addr) => Host::IPv4(addr.ip().octets()),
+            SocketAddr::V6(addr) => Host::IPv6(addr.ip().octets()),
+        };
+        let port = addr.port();
+        if let Some(ports) = self.hosts.get(&host) {
+            return ports.is_empty() || ports.contains(&port);
+        }
+        false
+    }
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone)]
@@ -155,8 +168,9 @@ pub struct ServiceIdentity {
     pub signature: Signature,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone)]
+#[derive(Archive, Serialize, Deserialize, Clone, Hash, Eq, PartialEq)]
 #[archive(check_bytes)]
+#[archive_attr(derive(Hash, Eq, PartialEq))]
 /// A host is an IP address or domain name.
 pub enum Host {
     IPv6([u8; 16]),
