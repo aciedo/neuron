@@ -6,8 +6,8 @@ use std::{
 };
 
 use hashbrown::HashMap;
-use petgraph::matrix_graph::MatrixGraph;
-use quinn::default_runtime;
+use petgraph::prelude::DiGraphMap;
+use quinn::{default_runtime, WriteError};
 use rustls::{
     internal::msgs::codec::Codec, server::AllowAnyAuthenticatedClient,
     Certificate as RustlsCert, PrivateKey,
@@ -16,30 +16,38 @@ use tokio::{
     select,
     sync::{mpsc, RwLock},
 };
+use tracing::{debug, warn};
 
+use crate::router::net::{
+    ski::HexDisplayExt,
+    wire::{
+        ControlMessage::{self, *},
+        SignedControlMessage,
+    },
+};
 
 use super::{
     axon::{Axon, ControlRecvStream, ControlSendStream},
     error::Error,
     ip_addr_to_socket_addr,
-    ski::{RouterIdentityService, Certificate, ServiceIdentity},
+    ski::{Certificate, RouterIdentityService, ServiceID, ServiceIdentity},
     NEURON_PORT, SKI_ROOT_CA,
 };
 
-type NodeID = [u8; 32];
-
-struct Edge {}
-
 struct Node {}
 
-type NetworkGraph = MatrixGraph<NodeID, Edge>;
+type NetworkGraph = DiGraphMap<ServiceID, u128>;
 
 struct Endpoint {
     ep: Arc<quinn::Endpoint>,
-    routers: Arc<RwLock<HashMap<NodeID, Certificate>>>,
+    routers: Arc<RwLock<HashMap<ServiceID, Certificate>>>,
     axons: Arc<RwLock<HashMap<usize, Axon>>>,
     network_graph: Arc<RwLock<NetworkGraph>>,
-    new_control_streams_tx: mpsc::UnboundedSender<(ControlSendStream, ControlRecvStream, ServiceIdentity)>,
+    new_control_streams_tx: mpsc::UnboundedSender<(
+        ControlSendStream,
+        ControlRecvStream,
+        ServiceIdentity,
+    )>,
     id_service: Arc<RouterIdentityService>,
 }
 
@@ -47,9 +55,11 @@ impl Endpoint {
     /// Creates a new QUIC endpoint bound to the given socket address with the
     /// given TLS configuration.
     pub fn new(
+        // An IP address to bind to.
         ip_addr: IpAddr,
-        key: &[u8],
-        cert: &[u8],
+        tls_key: &[u8],
+        tls_cert: &[u8],
+        // Handles SKI's additional security layer on top of TLS
         id_service: Arc<RouterIdentityService>,
     ) -> io::Result<Self> {
         let socket =
@@ -58,7 +68,8 @@ impl Endpoint {
             io::Error::new(io::ErrorKind::Other, "no async runtime found")
         })?;
 
-        let (client_tls, server_tls) = Self::tls_config(cert, key).unwrap();
+        let (client_tls, server_tls) =
+            Self::tls_config(tls_cert, tls_key).unwrap();
 
         // shared transport configuration for the server and client sides
         // this is the default config with the BBR congestion controller enabled
@@ -112,7 +123,11 @@ impl Endpoint {
     /// in a dedicated task.
     async fn start_acceptor(
         axons: Arc<RwLock<HashMap<usize, Axon>>>,
-        new_control_streams_tx: mpsc::UnboundedSender<(ControlSendStream, ControlRecvStream, ServiceIdentity)>,
+        new_control_streams_tx: mpsc::UnboundedSender<(
+            ControlSendStream,
+            ControlRecvStream,
+            ServiceIdentity,
+        )>,
         id_service: Arc<RouterIdentityService>,
         ep: Arc<quinn::Endpoint>,
     ) {
@@ -136,34 +151,121 @@ impl Endpoint {
     /// Handles control traffic and updating the network graph.
     async fn start_netwatch(
         graph: Arc<RwLock<NetworkGraph>>,
-        routers: Arc<RwLock<HashMap<NodeID, Certificate>>>,
-        mut new_control_channels_rx: mpsc::UnboundedReceiver<
-            (ControlSendStream, ControlRecvStream, ServiceIdentity)
-        >,
+        routers: Arc<RwLock<HashMap<ServiceID, Certificate>>>,
+        mut new_control_channels_rx: mpsc::UnboundedReceiver<(
+            ControlSendStream,
+            ControlRecvStream,
+            ServiceIdentity,
+        )>,
     ) {
         let (new_msg_tx, mut new_msg_rx) = mpsc::unbounded_channel();
         let (error_tx, mut error_rx) = mpsc::unbounded_channel();
-        let mut stream_transmitters = HashMap::new();
+        let mut stream_senders = HashMap::new();
+        let mut identities = HashMap::new();
         loop {
             select! {
                 Some((send_stream, mut recv_stream, identity)) = new_control_channels_rx.recv() => {
                     let error_tx = error_tx.clone();
                     let new_msg_tx = new_msg_tx.clone();
+                    let id = identity.cert.id.clone();
+                    identities.insert(identity.cert.id.clone(), identity);
+                    stream_senders.insert(id, send_stream);
                     tokio::spawn(async move {
                         loop {
                             match recv_stream.recv().await {
-                                Ok(msg) => { let _ = new_msg_tx.send(msg); },
+                                Ok(msg) => { let _ = new_msg_tx.send((msg, id)); },
+                                Err(Error::WriteError(e)) => {
+                                    match e {
+                                        WriteError::Stopped(_) => todo!(),
+                                        WriteError::ConnectionLost(_) => todo!(),
+                                        WriteError::UnknownStream => todo!(),
+                                        WriteError::ZeroRttRejected => todo!(),
+                                    }
+                                }
                                 Err(e) => { let _ = error_tx.send(e); },
                             };
                         }
                     });
-                    stream_transmitters.insert(identity.cert.id, send_stream);
                 }
-                Some(new_msg) = new_msg_rx.recv() => {
-                    
+                Some((new_msg, id)) = new_msg_rx.recv() => {
+                    let SignedControlMessage {
+                        msg,
+                        sent_at,
+                        signature,
+                        forwarded_from
+                    } = new_msg;
+                    // verify message's signature to verify who sent it
+                    // todo: we should be able to do this without reassembly into another vec
+                    let mut buf = Vec::with_capacity(8 + 4 + msg.len());
+                    buf.extend_from_slice(&sent_at.to_be_bytes());
+                    buf.extend_from_slice(&(msg.len() as u32).to_be_bytes());
+                    buf.extend_from_slice(&msg);
+                    let origin = match forwarded_from {
+                        Some(originator) => originator,
+                        None => id.clone(),
+                    };
+                    if !match identities.get(&origin) {
+                        Some(identity) => identity.cert.public_key.verify(&buf, &signature),
+                        None => {
+                            warn!("Received a message from unknown origin through peer {}. Ignoring.",
+                                id.hex());
+                            continue;
+                        },
+                    } {
+                        warn!("Received bad signature for a message from peer {} through peer {}. Ignoring.",
+                            origin.hex(), id.hex());
+                        continue;
+                    }
+                    // the incoming message is valid, so we can process it
+                    let msg = match ControlMessage::decode(&msg) {
+                        Some(msg) => msg,
+                        None => {
+                            warn!("Received a message from peer {} that could not be decoded. Ignoring.",
+                                id.hex());
+                            continue;
+                        },
+                    };
+                    match msg {
+                        ControlMessage::NewRouter(identity) => todo!(),
+                        ControlMessage::DeadRouter(id) => todo!(),
+                        ControlMessage::RTT(target, lat) => {
+                            if let Some(old_rtt) = graph.write().await.add_edge(id, target, lat) {
+                                debug!("Updated RTT from peer {} to peer {} from {}ms to {}ms",
+                                    id.hex(), target.hex(), old_rtt as f32 / 1000.0, lat as f32 / 1000.0);
+                            } else {
+                                debug!("Added RTT of {}ms from peer {} to peer {} ",
+                                    lat as f32 / 1000.0, id.hex(), target.hex());
+                            }
+                        },
+                        ControlMessage::WhoIs(id) => {
+                            // if we have a router with this id, send its identity to the origin
+                            if let Some(identity) = identities.get(&id) {
+                                let msg = ServiceIDMatched(identity.clone());
+                                // if let Some()
+                                // let _ = stream_senders.get_mut(&id).unwrap().send(msg).await;
+                            } // else, forward the message to all peers except the origin and the peer that sent it
+                            else {
+
+                            }
+                        },
+                        ControlMessage::ServiceIDMatched(_) => todo!(),
+                    }
                 }
                 Some(error) = error_rx.recv() => {
-
+                    match error {
+                        Error::ConnectError(_) => todo!(),
+                        Error::ConnectionError(_) => todo!(),
+                        Error::Io(_) => todo!(),
+                        Error::WriteError(_) => todo!(),
+                        Error::ReadExactError(_) => todo!(),
+                        Error::ReadToEndError(_) => todo!(),
+                        Error::ReceivedBadHandshakeMessage(_) => todo!(),
+                        Error::ReceivedBadControlMessage(_) => todo!(),
+                        Error::PeerSignatureDidNotMatchChallengeGiven => todo!(),
+                        Error::PeerCertNotSignedByCA => todo!(),
+                        Error::CouldNotDecodeMessage => todo!(),
+                        Error::MessageLengthOverflowed => todo!(),
+                    }
                 }
             }
         }

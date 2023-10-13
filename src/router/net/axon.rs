@@ -2,19 +2,22 @@ use crate::router::net::wire::ControlMessage;
 use std::{net::SocketAddr, sync::Arc};
 
 use arrayref::array_ref;
-use async_compression::tokio::{write::ZstdEncoder, bufread::ZstdDecoder};
-use byteorder::{LittleEndian, ByteOrder};
+use async_compression::tokio::{bufread::ZstdDecoder, write::ZstdEncoder};
+use byteorder::{ByteOrder, LittleEndian};
 use chrono::Utc;
-use kt2::{SIGN_BYTES, Signature};
+use kt2::{Signature, SIGN_BYTES};
 use quinn::{Connecting, RecvStream, SendStream};
-use tokio::io::{AsyncWriteExt, BufReader, AsyncReadExt};
-use tracing::{debug_span, debug};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tracing::{debug, debug_span};
 
 use super::{
     error::Error::{self, *},
     ip_addr_to_socket_addr,
     ski::{Challenge, RouterIdentityService, ServiceID, ServiceIdentity},
-    wire::{HandshakeMessage::{*, self}, SignedControlMessage},
+    wire::{
+        HandshakeMessage::{self, *},
+        SignedControlMessage,
+    },
     NEURON_PORT,
 };
 
@@ -33,7 +36,10 @@ impl Axon {
         in_progress: Connecting,
         should_open_streams: bool,
         id_service: Arc<RouterIdentityService>,
-    ) -> Result<(Self, ControlSendStream, ControlRecvStream, ServiceIdentity), Error> {
+    ) -> Result<
+        (Self, ControlSendStream, ControlRecvStream, ServiceIdentity),
+        Error,
+    > {
         let remote_addr = in_progress.remote_address();
         let local_ip =
             in_progress.local_ip().expect("local IP address missing");
@@ -57,17 +63,20 @@ impl Axon {
                     MyIdentityAndAChallengeForYou(x) => x,
                     other => Err(ReceivedBadHandshakeMessage(other))?,
                 };
-            
+
             debug!("received peer's certificate");
 
             if !id_service.validate_with_ca(&peer_identity) {
                 Err(PeerCertNotSignedByCA)?
             }
 
-            if !peer_identity.cert.validate_challenge(challenge_for_peer, sig) {
+            if !peer_identity
+                .cert
+                .validate_challenge(challenge_for_peer, sig)
+            {
                 Err(PeerSignatureDidNotMatchChallengeGiven)?
             }
-            
+
             debug!("peer's certificate is valid");
 
             let our_sig = id_service.sign_challenge(challenge_for_me);
@@ -80,11 +89,14 @@ impl Axon {
                 Ready => {
                     debug!("handshake complete");
                     (
-                        ControlSendStream::new(hs_send_stream, id_service.clone()), 
+                        ControlSendStream::new(
+                            hs_send_stream,
+                            id_service.clone(),
+                        ),
                         ControlRecvStream::new(hs_recv_stream),
-                        peer_identity
+                        peer_identity,
                     )
-                },
+                }
                 other => Err(ReceivedBadHandshakeMessage(other))?,
             }
         } else {
@@ -116,10 +128,11 @@ impl Axon {
 
             // Finally, we expect to receive a certificate from the initiator,
             // and validate it
-            let (peer_identity, peer_sig) = match hs_recv_stream.receive().await? {
-                MyIdentity((cert, sig)) => (cert, sig),
-                other => Err(ReceivedBadHandshakeMessage(other))?,
-            };
+            let (peer_identity, peer_sig) =
+                match hs_recv_stream.receive().await? {
+                    MyIdentity((cert, sig)) => (cert, sig),
+                    other => Err(ReceivedBadHandshakeMessage(other))?,
+                };
 
             if !id_service.validate_with_ca(&peer_identity) {
                 Err(PeerCertNotSignedByCA)?
@@ -131,16 +144,16 @@ impl Axon {
             {
                 Err(PeerSignatureDidNotMatchChallengeGiven)?
             }
-            
+
             debug!("peer's certificate is valid");
 
             hs_send_stream.send(Ready).await?;
             debug!("handshake complete");
-            
+
             (
-                ControlSendStream::new(hs_send_stream, id_service.clone()), 
+                ControlSendStream::new(hs_send_stream, id_service.clone()),
                 ControlRecvStream::new(hs_recv_stream),
-                peer_identity
+                peer_identity,
             )
         };
 
@@ -167,7 +180,7 @@ impl HandshakeSendStream {
     pub fn new(stream: SendStream) -> Self {
         Self(ZstdEncoder::new(stream))
     }
-    
+
     pub async fn send(&mut self, msg: HandshakeMessage) -> Result<(), Error> {
         let msg = msg.encode().unwrap();
         let len = msg.len();
@@ -185,7 +198,7 @@ impl HandshakeRecvStream {
     pub fn new(stream: RecvStream) -> Self {
         Self(ZstdDecoder::new(BufReader::new(stream)))
     }
-    
+
     pub async fn receive(&mut self) -> Result<HandshakeMessage, Error> {
         let mut len_buf = [0u8; 4];
         self.0.read_exact(&mut len_buf).await?;
@@ -203,25 +216,37 @@ pub struct ControlSendStream {
 }
 
 impl ControlSendStream {
-    pub fn new(stream: HandshakeSendStream, id_service: Arc<RouterIdentityService>) -> Self {
+    pub fn new(
+        stream: HandshakeSendStream,
+        id_service: Arc<RouterIdentityService>,
+    ) -> Self {
         Self {
             stream: stream.0,
             id_service,
         }
     }
-    
-    pub async fn send(&mut self, msg: ControlMessage, forwarded_from: Option<ServiceID>) -> Result<(), Error> {
+
+    pub async fn send(
+        &mut self,
+        msg: ControlMessage,
+        forwarded_from: Option<ServiceID>,
+    ) -> Result<(), Error> {
         let msg = msg.encode().unwrap();
         let len = msg.len();
         let sent_at = Utc::now().timestamp_micros();
-        let capacity = 1 + 8 + 4 + len + SIGN_BYTES + if forwarded_from.is_some() { 32 } else { 0 };
+        let capacity = 1
+            + 8
+            + 4
+            + len
+            + SIGN_BYTES
+            + if forwarded_from.is_some() { 32 } else { 0 };
         let mut buf = Vec::with_capacity(capacity);
         buf.push(forwarded_from.is_some() as u8);
         buf.extend_from_slice(&sent_at.to_le_bytes());
         buf.extend_from_slice(&(len as u32).to_le_bytes());
         buf.extend_from_slice(&msg);
         // we're only signing sent_at | len | msg
-        let sig = self.id_service.sign(&buf[1.. 8 + 4 + len]);
+        let sig = self.id_service.sign(&buf[1..8 + 4 + len]);
         buf.extend_from_slice(&sig.0);
         self.stream.write_all(&buf).await?;
         Ok(())
@@ -234,45 +259,45 @@ pub struct ControlRecvStream {
 
 impl ControlRecvStream {
     pub fn new(stream: HandshakeRecvStream) -> Self {
-        Self {
-            stream: stream.0,
-        }
+        Self { stream: stream.0 }
     }
-    
-    
+
     pub async fn recv(&mut self) -> Result<SignedControlMessage, Error> {
-        // forwarded message: FORWARD_FLAG | sent_at | len | msg | sig | service_id
-        // non-forwarded message: FORWARD_FLAG | sent_at | len | msg | sig
+        // forwarded message: FORWARD_FLAG | sent_at | len | msg | sig |
+        // service_id non-forwarded message: FORWARD_FLAG | sent_at |
+        // len | msg | sig
         let mut buf = [0u8; 1 + 8 + 4];
         self.stream.read(&mut buf).await?;
-        
+
         let forwarded_message = buf[0] == 1;
         let sent_at = LittleEndian::read_i64(&buf[1..9]);
         let msg_len = LittleEndian::read_u32(&buf[9..13]);
-        
+
         let len_to_read = if forwarded_message {
-            msg_len.checked_add(32 + SIGN_BYTES as u32)
+            msg_len
+                .checked_add(32 + SIGN_BYTES as u32)
                 .ok_or(MessageLengthOverflowed)? as usize
         } else {
-            msg_len.checked_add(SIGN_BYTES as u32)
+            msg_len
+                .checked_add(SIGN_BYTES as u32)
                 .ok_or(MessageLengthOverflowed)? as usize
         };
-        
+
         let mut buf = vec![0u8; len_to_read];
         self.stream.read_exact(&mut buf).await?;
-        
+
         let sig_and_maybe_sid = buf.split_off(msg_len as usize);
-        
+
         let sig = Signature(*array_ref![sig_and_maybe_sid, 0, SIGN_BYTES]);
-       
+
         let service_id = if forwarded_message {
             Some(*array_ref![sig_and_maybe_sid, SIGN_BYTES, 32])
         } else {
             None
         };
-        
-        Ok(SignedControlMessage { 
-            msg: buf, 
+
+        Ok(SignedControlMessage {
+            msg: buf,
             sent_at,
             signature: sig,
             forwarded_from: service_id,

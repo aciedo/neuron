@@ -18,5 +18,5 @@ mod net;
 // NEURON's architecture is designed to scale linearly per core, limited
 // ultimately by networking alone, given appropriate CPU cores for the number of
 // partitions. Theoretically, you could reach CPU frequency limits after this,
-// but this will likely be in the 80gbps+ per partition range. You'd have to be 
+// but this will likely be in the 80gbps+ per partition range. You'd have to be
 // breaching 5Tbps+ per cluster to even approach this sort of limit.

@@ -1,7 +1,7 @@
 use std::io;
 
-use quinn::{WriteError, ReadToEndError, ReadExactError};
-use quinn_proto::{ConnectionError, ConnectError};
+use quinn::{ReadExactError, ReadToEndError, WriteError};
+use quinn_proto::{ConnectError, ConnectionError};
 
 use super::wire::{ControlMessage, HandshakeMessage};
 

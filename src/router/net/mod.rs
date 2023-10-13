@@ -1,10 +1,10 @@
 use std::net::{IpAddr, SocketAddr};
 
-mod wire;
 mod axon;
 mod endpoint;
 mod error;
 mod ski;
+mod wire;
 
 /// Converts an IP address and port to a socket address.
 fn ip_addr_to_socket_addr(ip: IpAddr, port: u16) -> SocketAddr {

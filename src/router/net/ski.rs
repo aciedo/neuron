@@ -6,19 +6,53 @@
 // NEURON network in the wire protocol. It's currently hot-wired in a hybrid
 // system, which establishes a normal ECC based TLS1.3 connection and then
 // authenticates using challenges inside the connection. A custom transit
-// encryption codec using SKI inside KT2 will replace this hybrid system in the
-// future.
-//
+// encryption protocol using SKI inside KT2 will replace this hybrid system in
+// the future.
 
 use kt2::{PublicKey, SecretKey, Signature};
 use rkyv::{to_bytes, Archive, Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 
-
 pub type ServiceID = [u8; 32];
 
-/// The identity service stores a read-only, global copy of SKI's setup, including
-/// the network's root certificate authority and router's key and certificate.
+use std::fmt;
+
+pub struct HexSlice<'a>(&'a [u8]);
+
+impl<'a> HexSlice<'a> {
+    fn new<T>(data: &'a T) -> HexSlice<'a>
+    where
+        T: ?Sized + AsRef<[u8]> + 'a,
+    {
+        HexSlice(data.as_ref())
+    }
+}
+
+impl fmt::Display for HexSlice<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{:X}", byte)?;
+        }
+        Ok(())
+    }
+}
+
+pub trait HexDisplayExt {
+    fn hex(&self) -> HexSlice<'_>;
+}
+
+impl<T> HexDisplayExt for T
+where
+    T: ?Sized + AsRef<[u8]>,
+{
+    fn hex(&self) -> HexSlice<'_> {
+        HexSlice::new(self)
+    }
+}
+
+/// The identity service stores a read-only, global copy of SKI's setup,
+/// including the network's root certificate authority and router's key and
+/// certificate.
 pub struct RouterIdentityService {
     signed_cert: ServiceIdentity,
     key: SecretKey,
@@ -57,11 +91,8 @@ impl RouterIdentityService {
     pub fn cert(&self) -> &ServiceIdentity {
         &self.signed_cert
     }
-    
-    pub fn sign(
-        &self,
-        msg: &[u8],
-    ) -> Signature {
+
+    pub fn sign(&self, msg: &[u8]) -> Signature {
         self.key.sign(msg)
     }
 
@@ -102,10 +133,7 @@ impl Certificate {
         self.public_key.verify(&challenge.0, &sig)
     }
 
-    pub fn validate_certificate(
-        &self,
-        certificate: &ServiceIdentity,
-    ) -> bool {
+    pub fn validate_certificate(&self, certificate: &ServiceIdentity) -> bool {
         // todo: we should be able to validate this without re-serializing it
         let cert = match to_bytes::<_, 1024>(certificate) {
             Ok(c) => c,

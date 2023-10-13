@@ -1,7 +1,7 @@
 use kt2::Signature;
 use rkyv::{from_bytes, to_bytes, AlignedVec, Archive, Deserialize, Serialize};
 
-use super::ski::{Challenge, ServiceIdentity, ServiceID};
+use super::ski::{Challenge, ServiceID, ServiceIdentity};
 
 #[derive(Archive, Serialize, Deserialize)]
 #[archive(check_bytes)]
@@ -47,12 +47,13 @@ pub enum ControlMessage {
     NewRouter(ServiceIdentity),
     /// A router has been detected as dead
     DeadRouter(ServiceID),
-    /// An RTT measurement from a router to another router
-    RTT(ServiceID, ServiceID, u128),
+    /// A microsecond precision RTT (round-trip-time) measurement from the
+    /// broadcasting to another router
+    RTT(ServiceID, u128),
     /// A query asking for the identity of a router with a given ID
     WhoIs(ServiceID),
     /// A response to a WhoIs query
-    ServiceIDMatches(ServiceIdentity)
+    ServiceIDMatched(ServiceIdentity),
 }
 
 impl ControlMessage {
