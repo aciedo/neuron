@@ -106,7 +106,7 @@ impl Axon {
         } else {
             // we're on the receiving end of the connection
             debug!("waiting for peer to open control stream");
-            let (raw_tx, raw_rx) = conn.open_bi().await?;
+            let (raw_tx, raw_rx) = conn.accept_bi().await?;
             let mut hs_send_stream = HandshakeSendStream::new(raw_tx);
             let mut hs_recv_stream = HandshakeRecvStream::new(raw_rx);
             debug!("peer opened control stream");
