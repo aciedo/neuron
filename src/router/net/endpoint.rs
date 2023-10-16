@@ -9,7 +9,7 @@ use std::{
 use byteorder::{ByteOrder, LittleEndian};
 use hashbrown::{HashMap, HashSet};
 use petgraph::prelude::DiGraphMap;
-use quinn::{default_runtime, WriteError};
+use quinn::default_runtime;
 use quinn_proto::{IdleTimeout, VarInt};
 use rustls::{
     internal::msgs::codec::Codec, server::AllowAnyAuthenticatedClient,
@@ -33,11 +33,9 @@ use super::{
     axon::{Axon, ControlRecvStream, ControlSendStream},
     error::Error,
     ip_addr_to_socket_addr,
-    ski::{Certificate, RouterIdentityService, ServiceID, ServiceIdentity},
+    ski::{RouterIdentityService, ServiceID, ServiceIdentity},
     NEURON_PORT, SKI_ROOT_CA,
 };
-
-struct Node {}
 
 type NetworkGraph = DiGraphMap<ServiceID, u128>;
 
@@ -169,6 +167,7 @@ impl Endpoint {
         let span = debug_span!("netwatch");
         let _guard = span.enter();
         let (new_msg_tx, mut new_msg_rx) = mpsc::unbounded_channel();
+        let (rtt_tx, mut rtt_rx) = mpsc::unbounded_channel();
         let (error_tx, mut error_rx) = mpsc::unbounded_channel();
         // stores the sender half for each axon's control stream
         let mut stream_senders = HashMap::new();
@@ -176,14 +175,21 @@ impl Endpoint {
         let mut pending_whois_requests: HashSet<ServiceID> = HashSet::new();
         // stores messages we've received but waiting to process (likely
         // because we're waiting for a whois response for the origin)
-        let mut queued_messages: VecDeque<([u8; 32], SignedControlMessage)> =
-            VecDeque::new();
+        let mut queued_messages: HashMap<ServiceID, Vec<SignedControlMessage>> =
+            HashMap::new();
         loop {
-            for i in 0..queued_messages.len() {
-                if !pending_whois_requests.contains(&queued_messages[i].0) {
-                    let (id, msg) = queued_messages.remove(i).unwrap();
-                    new_msg_tx.send((id, msg)).expect("netwatch isn't running");
-                    continue;
+            for id in queued_messages
+                .keys()
+                .filter(|id| !pending_whois_requests.contains(*id))
+                .cloned()
+                .collect::<Vec<_>>()
+            {
+                if let Some(msgs) = queued_messages.remove(&id) {
+                    for msg in msgs {
+                        new_msg_tx
+                            .send((id.clone(), msg))
+                            .expect("netwatch isn't running");
+                    }
                 }
             }
 
@@ -191,6 +197,7 @@ impl Endpoint {
                 Some((send_stream, mut recv_stream, identity)) = new_control_channels_rx.recv() => {
                     let error_tx = error_tx.clone();
                     let new_msg_tx = new_msg_tx.clone();
+                    let rtt_tx = rtt_tx.clone();
                     let id = identity.cert.id.clone();
                     routers.write().await.insert(identity.cert.id.clone(), identity);
                     stream_senders.insert(id, send_stream);
@@ -217,7 +224,7 @@ impl Endpoint {
                     } else {
                         debug!("Received a message from unknown origin through peer {}. Querying peers for identity of origin.",
                             id.hex());
-                        queued_messages.push_back((id, signed_msg));
+                        queued_messages.entry(origin.clone()).or_insert(Vec::new()).push(signed_msg);
                         if !pending_whois_requests.contains(&origin) {
                             pending_whois_requests.insert(origin.clone());
                             let msg = WhoIs(origin);
@@ -233,7 +240,7 @@ impl Endpoint {
                         continue;
                     }
 
-                    let sent_at = LittleEndian::read_u64(&signed_msg.buf.0[0..8]);
+                    let _sent_at = LittleEndian::read_u64(&signed_msg.buf.0[0..8]);
                     let len = LittleEndian::read_u32(&signed_msg.buf.0[8..12]) as usize;
                     let msg = &signed_msg.buf.0[12..12+len];
 
@@ -278,7 +285,20 @@ impl Endpoint {
 
                             debug!("Added new router {} from peer {}", identity.cert.id.hex(), id.hex());
                         },
-                        ControlMessage::DeadRouter(id) => todo!(),
+                        ControlMessage::DeadRouter(id) => {
+                            tokio::join!(
+                                async {
+                                    routers.write().await.remove(&id);
+                                },
+                                async {
+                                    graph.write().await.remove_node(id);
+                                },
+                            );
+                            stream_senders.remove(&id);
+                            pending_whois_requests.remove(&id);
+                            queued_messages.remove(&id);
+                            debug!("Removed dead router {}", id.hex());
+                        },
                         ControlMessage::RTT(target, new_rtt) => {
                             if let Some(old_rtt) = graph.write().await.add_edge(id, target, new_rtt) {
                                 debug!("Updated RTT from peer {} to peer {} from {}ms to {}ms",
@@ -292,13 +312,15 @@ impl Endpoint {
                             // if we have a router with this id, send its identity to the origin
                             if let Some(identity) = routers.read().await.get(&id) {
                                 let msg = ServiceIDMatched(identity.clone());
-                                stream_senders.get_mut(&id).expect("stream sender doesn't exist for a identity in routers").send(msg, None).await
+                                stream_senders.get_mut(&id)
+                                    .expect("stream sender doesn't exist for a identity in routers")
+                                    .send(msg, None).await
                                     .or_else(|e| error_tx.send((id, e)))
                                     .expect("netwatch isn't running");
                             } else { // forward the message to all peers except the origin and the peer that sent it
                                 for (peer_id, sender) in stream_senders.iter_mut() {
                                     if peer_id != &id && peer_id != &origin {
-                                        sender.send(msg.clone(), None).await
+                                        sender.send(msg.clone(), Some(origin)).await
                                             .or_else(|e| error_tx.send((id, e)))
                                             .expect("netwatch isn't running");
                                     }
@@ -324,7 +346,7 @@ impl Endpoint {
                         },
                     }
                 }
-                Some((peer_id, error)) = error_rx.recv() => {
+                Some((_peer_id, _error)) = error_rx.recv() => {
 
                 }
             }

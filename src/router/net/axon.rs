@@ -1,7 +1,7 @@
 use crate::router::net::wire::ControlMessage;
 use std::{net::SocketAddr, sync::Arc};
 
-use arrayref::{array_mut_ref, array_ref};
+use arrayref::{array_ref};
 use async_compression::tokio::{bufread::ZstdDecoder, write::ZstdEncoder};
 use byteorder::{ByteOrder, LittleEndian};
 use chrono::Utc;
