@@ -1,7 +1,7 @@
 use crate::router::net::wire::ControlMessage;
 use std::{net::SocketAddr, sync::Arc};
 
-use arrayref::array_ref;
+use arrayref::{array_mut_ref, array_ref};
 use async_compression::tokio::{bufread::ZstdDecoder, write::ZstdEncoder};
 use byteorder::{ByteOrder, LittleEndian};
 use chrono::Utc;
@@ -16,7 +16,7 @@ use super::{
     ski::{Challenge, RouterIdentityService, ServiceID, ServiceIdentity},
     wire::{
         HandshakeMessage::{self, *},
-        SignedControlMessage,
+        InnerMessageBuf, SignedControlMessage,
     },
     NEURON_PORT,
 };
@@ -66,7 +66,11 @@ impl Axon {
 
             debug!("received peer's certificate");
 
-            if !id_service.validate_with_ca(&peer_identity) {
+            if !peer_identity.cert.validate_self_id() {
+                Err(PeerCertIDDoesNotMatchPublicKey)?
+            }
+
+            if !id_service.validate_identity_against_ca(&peer_identity) {
                 Err(PeerCertNotSignedByCA)?
             }
 
@@ -138,7 +142,7 @@ impl Axon {
                     other => Err(ReceivedBadHandshakeMessage(other))?,
                 };
 
-            if !id_service.validate_with_ca(&peer_identity) {
+            if !id_service.validate_identity_against_ca(&peer_identity) {
                 Err(PeerCertNotSignedByCA)?
             }
 
@@ -271,19 +275,21 @@ impl ControlRecvStream {
     }
 
     pub async fn recv(&mut self) -> Result<SignedControlMessage, Error> {
-        // forwarded message: FORWARD_FLAG | sent_at | len | msg | sig |
-        // service_id non-forwarded message: FORWARD_FLAG | sent_at |
-        // len | msg | sig
-        let mut buf = [0u8; 1 + 8 + 4];
-        self.stream.read(&mut buf).await?;
+        // forwarded message:
+        // FORWARD_FLAG | sent_at | len | msg | sig | service_id
+        // non-forwarded message:
+        // FORWARD_FLAG | sent_at | len | msg | sig
 
-        let forwarded_message = buf[0] == 1;
-        let sent_at = LittleEndian::read_i64(&buf[1..9]);
-        let msg_len = LittleEndian::read_u32(&buf[9..13]);
+        // read the forward flag, sent_at, and len
+        let mut prefix_buf = [0u8; 1 + 8 + 4];
+        self.stream.read(&mut prefix_buf).await?;
+
+        let forwarded_message = prefix_buf[0] == 1;
+        let msg_len = LittleEndian::read_u32(&prefix_buf[9..13]);
 
         let len_to_read = if forwarded_message {
             msg_len
-                .checked_add(32 + SIGN_BYTES as u32)
+                .checked_add(SIGN_BYTES as u32 + 32)
                 .ok_or(MessageLengthOverflowed)? as usize
         } else {
             msg_len
@@ -291,13 +297,12 @@ impl ControlRecvStream {
                 .ok_or(MessageLengthOverflowed)? as usize
         };
 
-        let mut buf = vec![0u8; len_to_read];
-        self.stream.read_exact(&mut buf).await?;
+        let mut buf = vec![0u8; 8 + 4 + len_to_read];
+        buf[0..12].copy_from_slice(&prefix_buf[1..13]);
+        self.stream.read_exact(&mut buf[12..len_to_read]).await?;
 
         let sig_and_maybe_sid = buf.split_off(msg_len as usize);
-
         let sig = Signature(*array_ref![sig_and_maybe_sid, 0, SIGN_BYTES]);
-
         let service_id = if forwarded_message {
             Some(*array_ref![sig_and_maybe_sid, SIGN_BYTES, 32])
         } else {
@@ -305,8 +310,7 @@ impl ControlRecvStream {
         };
 
         Ok(SignedControlMessage {
-            msg: buf,
-            sent_at,
+            buf: InnerMessageBuf(buf),
             signature: sig,
             forwarded_from: service_id,
         })

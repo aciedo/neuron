@@ -17,6 +17,7 @@ pub enum Error {
     PeerSignatureDidNotMatchChallengeGiven,
     PeerCertNotSignedByCA,
     PeerCertDoesNotIncludeTheirAddr,
+    PeerCertIDDoesNotMatchPublicKey,
     CouldNotDecodeMessage,
     MessageLengthOverflowed,
 }

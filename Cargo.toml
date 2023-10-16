@@ -16,6 +16,7 @@ router = []
 [dependencies]
 arrayref = "0.3.7"
 async-compression = { version = "0.4.4", features = ["zstd", "tokio"] }
+blake3 = "1.5.0"
 byteorder = "1.5.0"
 chrono = "0.4.31"
 futures = "0.3.28"

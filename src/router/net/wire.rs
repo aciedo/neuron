@@ -3,13 +3,13 @@ use rkyv::{from_bytes, to_bytes, AlignedVec, Archive, Deserialize, Serialize};
 
 use super::ski::{Challenge, ServiceID, ServiceIdentity};
 
-#[derive(Archive, Serialize, Deserialize)]
-#[archive(check_bytes)]
+/// A buffer containing a sent_at | len | msg concatenation
+pub struct InnerMessageBuf(pub Vec<u8>);
+
+/// A partially deconstructed wire message
 pub struct SignedControlMessage {
-    /// the serialized ControlMessage
-    pub msg: Vec<u8>,
-    /// A UTC microsecond-precision timestamp of when this message was sent
-    pub sent_at: i64,
+    /// sent_at | len | msg
+    pub buf: InnerMessageBuf,
     /// the signature of sent_at | msg.len() | msg
     pub signature: Signature,
     /// the service ID of the router that created this message
@@ -40,7 +40,7 @@ impl HandshakeMessage {
     }
 }
 
-#[derive(Archive, Serialize, Deserialize)]
+#[derive(Archive, Serialize, Deserialize, Clone)]
 #[archive(check_bytes)]
 pub enum ControlMessage {
     /// A new router has joined the network

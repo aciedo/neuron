@@ -9,6 +9,7 @@
 // encryption protocol using SKI inside KT2 will replace this hybrid system in
 // the future.
 
+use blake3::hash;
 use hashbrown::{HashMap, HashSet};
 use kt2::{PublicKey, SecretKey, Signature};
 use rkyv::{to_bytes, Archive, Deserialize, Serialize};
@@ -75,7 +76,7 @@ impl RouterIdentityService {
         if expected_pk != signed_cert.cert.public_key {
             Err(Error::KeyDoesNotMatchCertificate)?;
         }
-        if !ca.validate_certificate(&signed_cert) {
+        if !ca.validate_identity(&signed_cert) {
             Err(Error::CertificateNotSignedByCA)?
         }
         Ok(Self {
@@ -85,20 +86,27 @@ impl RouterIdentityService {
         })
     }
 
+    /// Signs a challenge with the router's private key.
     pub fn sign_challenge(&self, challenge: Challenge) -> Signature {
         self.key.sign(&challenge.0)
     }
 
+    /// Returns the router's public key.
     pub fn cert(&self) -> &ServiceIdentity {
         &self.signed_cert
     }
 
+    /// Signs a message with the router's private key.
     pub fn sign(&self, msg: &[u8]) -> Signature {
         self.key.sign(msg)
     }
 
-    pub fn validate_with_ca(&self, signed_cert: &ServiceIdentity) -> bool {
-        self.ca.validate_certificate(signed_cert)
+    /// Returns true if the provided identity is signed by the root CA.
+    pub fn validate_identity_against_ca(
+        &self,
+        identity: &ServiceIdentity,
+    ) -> bool {
+        self.ca.validate_identity(identity)
     }
 }
 
@@ -126,6 +134,8 @@ pub struct Certificate {
 }
 
 impl Certificate {
+    /// Returns true if the signature is valid for this challenge against the
+    /// certificate.
     pub fn validate_challenge(
         &self,
         challenge: Challenge,
@@ -134,16 +144,20 @@ impl Certificate {
         self.public_key.verify(&challenge.0, &sig)
     }
 
-    pub fn validate_certificate(&self, certificate: &ServiceIdentity) -> bool {
+    /// Returns true if the provided service identity has been signed by this
+    /// certificate.
+    pub fn validate_identity(&self, identity: &ServiceIdentity) -> bool {
         // todo: we should be able to validate this without re-serializing it
-        let cert = match to_bytes::<_, 1024>(certificate) {
+        let cert = match to_bytes::<_, 1024>(identity) {
             Ok(c) => c,
             Err(_) => return false,
         };
 
-        self.public_key.verify(&cert, &certificate.signature)
+        self.public_key.verify(&cert, &identity.signature)
     }
 
+    /// Returns true if this certificate is valid for the provided host and
+    /// port.
     pub fn includes_socket_addr(&self, addr: &SocketAddr) -> bool {
         let host = match addr {
             SocketAddr::V4(addr) => Host::IPv4(addr.ip().octets()),
@@ -154,6 +168,32 @@ impl Certificate {
             return ports.is_empty() || ports.contains(&port);
         }
         false
+    }
+
+    /// Returns true if the hash of the public key matches the certificate's
+    /// ID.
+    pub fn validate_self_id(&self) -> bool {
+        *hash(&self.public_key.bytes).as_bytes() == self.id
+    }
+
+    /// Returns true if this certificate is valid for any of the provided tags.
+    pub fn contains_any_tag(&self, tags: &[String]) -> bool {
+        for tag in tags {
+            if self.tags.contains(tag) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns true if this certificate is valid for all of the provided tags.
+    pub fn contains_all_tags(&self, tags: &[String]) -> bool {
+        for tag in tags {
+            if !self.tags.contains(tag) {
+                return false;
+            }
+        }
+        true
     }
 }
 
