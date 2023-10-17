@@ -92,7 +92,7 @@ impl RouterIdentityService {
     }
 
     /// Returns the router's public key.
-    pub fn cert(&self) -> &ServiceIdentity {
+    pub fn identity(&self) -> &ServiceIdentity {
         &self.signed_cert
     }
 

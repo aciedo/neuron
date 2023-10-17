@@ -1,13 +1,12 @@
 use std::{
-    collections::VecDeque,
     io::{self, BufReader, Cursor},
     net::{IpAddr, SocketAddr, UdpSocket},
     sync::Arc,
     time::Duration,
 };
 
-use byteorder::{ByteOrder, LittleEndian};
-use hashbrown::{HashMap, HashSet};
+use chrono::{DateTime, Utc};
+use hashbrown::HashMap;
 use petgraph::prelude::DiGraphMap;
 use quinn::default_runtime;
 use quinn_proto::{IdleTimeout, VarInt};
@@ -15,40 +14,36 @@ use rustls::{
     internal::msgs::codec::Codec, server::AllowAnyAuthenticatedClient,
     Certificate as RustlsCert, PrivateKey,
 };
-use tokio::{
-    select,
-    sync::{mpsc, RwLock},
-};
-use tracing::{debug, debug_span, warn};
-
-use crate::router::net::{
-    ski::HexDisplayExt,
-    wire::{
-        ControlMessage::{self, *},
-        SignedControlMessage,
-    },
-};
+use tokio::sync::{mpsc, RwLock};
 
 use super::{
     axon::{Axon, ControlRecvStream, ControlSendStream},
     error::Error,
     ip_addr_to_socket_addr,
+    netwatch::NetWatch,
     ski::{RouterIdentityService, ServiceID, ServiceIdentity},
     NEURON_PORT, SKI_ROOT_CA,
 };
 
-type NetworkGraph = DiGraphMap<ServiceID, u128>;
+#[derive(Clone, Copy)]
+pub struct LatencyEdge {
+    /// Round-trip-time latency in microseconds
+    pub rtt: u128,
+    /// Last updated at this time
+    pub last_updated: DateTime<Utc>,
+}
+
+pub type NetworkGraph = DiGraphMap<ServiceID, LatencyEdge>;
+
+pub type NewControlStream =
+    (Axon, ControlSendStream, ControlRecvStream, ServiceIdentity);
 
 struct Endpoint {
     ep: Arc<quinn::Endpoint>,
     routers: Arc<RwLock<HashMap<ServiceID, ServiceIdentity>>>,
-    axons: Arc<RwLock<HashMap<usize, Axon>>>,
+    axons: Arc<RwLock<HashMap<ServiceID, Axon>>>,
     network_graph: Arc<RwLock<NetworkGraph>>,
-    new_control_streams_tx: mpsc::UnboundedSender<(
-        ControlSendStream,
-        ControlRecvStream,
-        ServiceIdentity,
-    )>,
+    new_control_streams_tx: mpsc::UnboundedSender<NewControlStream>,
     id_service: Arc<RouterIdentityService>,
 }
 
@@ -107,12 +102,11 @@ impl Endpoint {
             id_service.clone(),
             ep.clone(),
         ));
-        tokio::spawn(Self::start_netwatch(
-            network_graph.clone(),
-            routers.clone(),
-            new_control_streams_rx,
-            id_service.clone(),
-        ));
+        let netwatch = Arc::new(NetWatch::new(id_service.clone()));
+        let nw_clone = netwatch.clone();
+        tokio::spawn(
+            async move { nw_clone.start(new_control_streams_rx).await },
+        );
         Ok(Self {
             ep,
             routers,
@@ -127,12 +121,8 @@ impl Endpoint {
     /// This will run until the endpoint is shut down, so it should be spawned
     /// in a dedicated task.
     async fn start_acceptor(
-        axons: Arc<RwLock<HashMap<usize, Axon>>>,
-        new_control_streams_tx: mpsc::UnboundedSender<(
-            ControlSendStream,
-            ControlRecvStream,
-            ServiceIdentity,
-        )>,
+        axons: Arc<RwLock<HashMap<ServiceID, Axon>>>,
+        new_control_streams_tx: mpsc::UnboundedSender<NewControlStream>,
         id_service: Arc<RouterIdentityService>,
         ep: Arc<quinn::Endpoint>,
     ) {
@@ -141,215 +131,18 @@ impl Endpoint {
             let new_control_streams_tx = new_control_streams_tx.clone();
             let id_service = id_service.clone();
             tokio::spawn(async move {
-                if let Ok((axon, send_stream, recv_stream, cert)) =
+                if let Ok((axon, send_stream, recv_stream, identity)) =
                     Axon::new(in_progress, false, id_service).await
                 {
-                    axons.write().await.insert(axon.id(), axon);
+                    axons
+                        .write()
+                        .await
+                        .insert(identity.cert.id.clone(), axon.clone());
                     new_control_streams_tx
-                        .send((send_stream, recv_stream, cert))
+                        .send((axon, send_stream, recv_stream, identity))
                         .expect("netwatch isn't running");
                 }
             });
-        }
-    }
-
-    /// Handles control traffic and updating the network graph.
-    async fn start_netwatch(
-        graph: Arc<RwLock<NetworkGraph>>,
-        routers: Arc<RwLock<HashMap<ServiceID, ServiceIdentity>>>,
-        mut new_control_channels_rx: mpsc::UnboundedReceiver<(
-            ControlSendStream,
-            ControlRecvStream,
-            ServiceIdentity,
-        )>,
-        id_service: Arc<RouterIdentityService>,
-    ) {
-        let span = debug_span!("netwatch");
-        let _guard = span.enter();
-        let (new_msg_tx, mut new_msg_rx) = mpsc::unbounded_channel();
-        let (rtt_tx, mut rtt_rx) = mpsc::unbounded_channel();
-        let (error_tx, mut error_rx) = mpsc::unbounded_channel();
-        // stores the sender half for each axon's control stream
-        let mut stream_senders = HashMap::new();
-        // stores active whois requests we're waiting for responses to
-        let mut pending_whois_requests: HashSet<ServiceID> = HashSet::new();
-        // stores messages we've received but waiting to process (likely
-        // because we're waiting for a whois response for the origin)
-        let mut queued_messages: HashMap<ServiceID, Vec<SignedControlMessage>> =
-            HashMap::new();
-        loop {
-            for id in queued_messages
-                .keys()
-                .filter(|id| !pending_whois_requests.contains(*id))
-                .cloned()
-                .collect::<Vec<_>>()
-            {
-                if let Some(msgs) = queued_messages.remove(&id) {
-                    for msg in msgs {
-                        new_msg_tx
-                            .send((id.clone(), msg))
-                            .expect("netwatch isn't running");
-                    }
-                }
-            }
-
-            select! {
-                Some((send_stream, mut recv_stream, identity)) = new_control_channels_rx.recv() => {
-                    let error_tx = error_tx.clone();
-                    let new_msg_tx = new_msg_tx.clone();
-                    let rtt_tx = rtt_tx.clone();
-                    let id = identity.cert.id.clone();
-                    routers.write().await.insert(identity.cert.id.clone(), identity);
-                    stream_senders.insert(id, send_stream);
-                    tokio::spawn(async move {
-                        loop {
-                            match recv_stream.recv().await {
-                                Ok(msg) => { let _ = new_msg_tx.send((id, msg)); },
-                                Err(e) => error_tx.send((id, e)).expect("netwatch isn't running"),
-                            };
-                        }
-                    });
-                }
-                Some((id, signed_msg)) = new_msg_rx.recv() => {
-                    let origin = match signed_msg.forwarded_from {
-                        Some(originator) => originator,
-                        None => id.clone(),
-                    };
-                    if let Some(identity) = routers.read().await.get(&origin) {
-                        if !identity.cert.public_key.verify(&signed_msg.buf.0, &signed_msg.signature) {
-                            warn!("Received bad signature for a message from peer {} through peer {}. Ignoring.",
-                                origin.hex(), id.hex());
-                            continue;
-                        }
-                    } else {
-                        debug!("Received a message from unknown origin through peer {}. Querying peers for identity of origin.",
-                            id.hex());
-                        queued_messages.entry(origin.clone()).or_insert(Vec::new()).push(signed_msg);
-                        if !pending_whois_requests.contains(&origin) {
-                            pending_whois_requests.insert(origin.clone());
-                            let msg = WhoIs(origin);
-                            for (peer_id, send_stream) in stream_senders.iter_mut() {
-                                if peer_id != &id {
-                                    if let Err(e) = send_stream.send(msg.clone(), None).await {
-                                        error_tx.send((id.clone(), e))
-                                            .expect("netwatch isn't running");
-                                    }
-                                }
-                            }
-                        }
-                        continue;
-                    }
-
-                    let _sent_at = LittleEndian::read_u64(&signed_msg.buf.0[0..8]);
-                    let len = LittleEndian::read_u32(&signed_msg.buf.0[8..12]) as usize;
-                    let msg = &signed_msg.buf.0[12..12+len];
-
-                    let msg = match ControlMessage::decode(&msg) {
-                        Some(msg) => msg,
-                        None => {
-                            warn!("Received a message from peer {} that could not be decoded. Ignoring.",
-                                id.hex());
-                            continue;
-                        },
-                    };
-
-                    match msg {
-                        ControlMessage::NewRouter(identity) => {
-                            if routers.read().await.contains_key(&identity.cert.id) {
-                                warn!("Received a NewRouter message from peer {} for peer {} that we already know about. Ignoring.",
-                                    id.hex(), identity.cert.id.hex());
-                                continue;
-                            }
-                            if !identity.cert.validate_self_id() {
-                                warn!("Received a NewRouter message from peer {} for peer {} whose ID didn't match its public key. Ignoring.",
-                                    id.hex(), identity.cert.id.hex());
-                                continue;
-                            }
-                            if id_service.validate_identity_against_ca(&identity) {
-                                warn!("Received a NewRouter message from peer {} for peer {} that wasn't signed by our root CA. Ignoring.",
-                                    id.hex(), identity.cert.id.hex());
-                                continue;
-                            }
-
-                            let identity1 = identity.clone();
-                            let cert_id2 = identity.cert.id.clone();
-
-                            tokio::join!(
-                                async {
-                                    routers.write().await.insert(identity1.cert.id, identity1);
-                                },
-                                async {
-                                    graph.write().await.add_node(cert_id2);
-                                },
-                            );
-
-                            debug!("Added new router {} from peer {}", identity.cert.id.hex(), id.hex());
-                        },
-                        ControlMessage::DeadRouter(id) => {
-                            tokio::join!(
-                                async {
-                                    routers.write().await.remove(&id);
-                                },
-                                async {
-                                    graph.write().await.remove_node(id);
-                                },
-                            );
-                            stream_senders.remove(&id);
-                            pending_whois_requests.remove(&id);
-                            queued_messages.remove(&id);
-                            debug!("Removed dead router {}", id.hex());
-                        },
-                        ControlMessage::RTT(target, new_rtt) => {
-                            if let Some(old_rtt) = graph.write().await.add_edge(id, target, new_rtt) {
-                                debug!("Updated RTT from peer {} to peer {} from {}ms to {}ms",
-                                    id.hex(), target.hex(), old_rtt as f32 / 1000.0, new_rtt as f32 / 1000.0);
-                            } else {
-                                debug!("Added RTT of {}ms from peer {} to peer {}",
-                                    (new_rtt as f32 * 100.0).round() / 100.0, id.hex(), target.hex());
-                            }
-                        },
-                        ControlMessage::WhoIs(id) => {
-                            // if we have a router with this id, send its identity to the origin
-                            if let Some(identity) = routers.read().await.get(&id) {
-                                let msg = ServiceIDMatched(identity.clone());
-                                stream_senders.get_mut(&id)
-                                    .expect("stream sender doesn't exist for a identity in routers")
-                                    .send(msg, None).await
-                                    .or_else(|e| error_tx.send((id, e)))
-                                    .expect("netwatch isn't running");
-                            } else { // forward the message to all peers except the origin and the peer that sent it
-                                for (peer_id, sender) in stream_senders.iter_mut() {
-                                    if peer_id != &id && peer_id != &origin {
-                                        sender.send(msg.clone(), Some(origin)).await
-                                            .or_else(|e| error_tx.send((id, e)))
-                                            .expect("netwatch isn't running");
-                                    }
-                                }
-                            }
-                        },
-                        ControlMessage::ServiceIDMatched(identity) => {
-                            if pending_whois_requests.remove(&identity.cert.id) {
-                                if !identity.cert.validate_self_id() {
-                                    warn!("Received a ServiceIDMatched message from peer {} for peer {} whose ID didn't match its public key. Ignoring.",
-                                        id.hex(), identity.cert.id.hex());
-                                    continue;
-                                }
-                                if id_service.validate_identity_against_ca(&identity) {
-                                    warn!("Received a ServiceIDMatched message from peer {} for peer {} that wasn't signed by our root CA. Ignoring.",
-                                        id.hex(), identity.cert.id.hex());
-                                    continue;
-                                }
-                                debug!("Received an identity from peer {} for peer {}",
-                                    id.hex(), identity.cert.id.hex());
-                                routers.write().await.insert(identity.cert.id, identity);
-                            }
-                        },
-                    }
-                }
-                Some((_peer_id, _error)) = error_rx.recv() => {
-
-                }
-            }
         }
     }
 
@@ -358,15 +151,18 @@ impl Endpoint {
         remote: SocketAddr,
         remote_name: &str,
     ) -> Result<(), Error> {
-        let (axon, send_stream, recv_stream, service_identity) = Axon::new(
+        let (axon, send_stream, recv_stream, identity) = Axon::new(
             self.ep.connect(remote, remote_name)?,
             true,
             self.id_service.clone(),
         )
         .await?;
-        self.axons.write().await.insert(axon.id(), axon);
+        self.axons
+            .write()
+            .await
+            .insert(identity.cert.id, axon.clone());
         self.new_control_streams_tx
-            .send((send_stream, recv_stream, service_identity))
+            .send((axon, send_stream, recv_stream, identity))
             .expect("netwatch isn't running");
         Ok(())
     }

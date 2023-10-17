@@ -3,6 +3,7 @@ use std::net::{IpAddr, SocketAddr};
 mod axon;
 mod endpoint;
 mod error;
+mod netwatch;
 mod ski;
 mod wire;
 

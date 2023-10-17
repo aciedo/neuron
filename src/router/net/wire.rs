@@ -3,6 +3,8 @@ use rkyv::{from_bytes, to_bytes, AlignedVec, Archive, Deserialize, Serialize};
 
 use super::ski::{Challenge, ServiceID, ServiceIdentity};
 
+pub type MessageID = [u8; 8];
+
 /// A buffer containing a sent_at | len | msg concatenation
 pub struct InnerMessageBuf(pub Vec<u8>);
 
@@ -50,9 +52,11 @@ pub enum ControlMessage {
     /// A microsecond precision RTT (round-trip-time) measurement from the
     /// broadcasting to another router
     RTT(ServiceID, u128),
-    /// A query asking for the identity of a router with a given ID
+    /// A query asking for the identity of a router with a given ID.
+    /// Sometimes routers will receive messages for peers that they don't know
+    /// about
     WhoIs(ServiceID),
-    /// A response to a WhoIs query
+    /// A response to a WhoIs query from another router
     ServiceIDMatched(ServiceIdentity),
 }
 

@@ -1,7 +1,7 @@
 use crate::router::net::wire::ControlMessage;
 use std::{net::SocketAddr, sync::Arc};
 
-use arrayref::{array_ref};
+use arrayref::array_ref;
 use async_compression::tokio::{bufread::ZstdDecoder, write::ZstdEncoder};
 use byteorder::{ByteOrder, LittleEndian};
 use chrono::Utc;
@@ -23,6 +23,9 @@ use super::{
 
 /// Axons are QUIC backbone links that connect Aciedo's global infrastructure
 /// together.
+///
+/// Can be cloned to obtain another handle to the same axon.
+#[derive(Clone)]
 pub struct Axon {
     conn: quinn::Connection,
     local_addr: SocketAddr,
@@ -41,8 +44,9 @@ impl Axon {
         Error,
     > {
         let remote_addr = in_progress.remote_address();
-        let local_ip =
-            in_progress.local_ip().expect("local IP address missing");
+        let local_ip = in_progress
+            .local_ip()
+            .expect("local IP address missing (platform not supported?)");
         let span = debug_span!("axon", remote = %remote_addr);
         let _guard = span.enter();
         debug!("establishing QUIC connection");
@@ -88,7 +92,7 @@ impl Axon {
             debug!("peer's certificate is valid");
 
             let our_sig = id_service.sign_challenge(challenge_for_me);
-            let our_cert = (*id_service.cert()).clone();
+            let our_cert = (*id_service.identity()).clone();
             let msg = MyIdentity((our_cert, our_sig));
             hs_send_stream.send(msg).await?;
             debug!("sent our certificate to peer");
@@ -123,7 +127,7 @@ impl Axon {
             debug!("received challenge from peer");
 
             // Then, we sign the challenge and send back our certificate.
-            let our_cert = (*id_service.cert()).clone();
+            let our_cert = (*id_service.identity()).clone();
             let our_sig = id_service.sign_challenge(challenge_for_me.clone());
             let challenge_for_peer = Challenge::new();
             let msg = MyIdentityAndAChallengeForYou((
@@ -152,7 +156,7 @@ impl Axon {
             {
                 Err(PeerSignatureDidNotMatchChallengeGiven)?
             }
-            
+
             if !peer_identity.cert.includes_socket_addr(&remote_addr) {
                 Err(PeerCertDoesNotIncludeTheirAddr)?
             }
@@ -183,6 +187,18 @@ impl Axon {
 
     pub fn id(&self) -> usize {
         self.conn.stable_id()
+    }
+
+    pub fn conn(&self) -> &quinn::Connection {
+        &self.conn
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.remote_addr
     }
 }
 
