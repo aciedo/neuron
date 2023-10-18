@@ -17,40 +17,9 @@ use typed_builder::TypedBuilder;
 
 pub type ServiceID = [u8; 32];
 
-use std::{fmt, net::SocketAddr};
+use std::net::SocketAddr;
 
-pub struct HexSlice<'a>(&'a [u8]);
-
-impl<'a> HexSlice<'a> {
-    fn new<T>(data: &'a T) -> HexSlice<'a>
-    where
-        T: ?Sized + AsRef<[u8]> + 'a,
-    {
-        HexSlice(data.as_ref())
-    }
-}
-
-impl fmt::Display for HexSlice<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.0 {
-            write!(f, "{:X}", byte)?;
-        }
-        Ok(())
-    }
-}
-
-pub trait HexDisplayExt {
-    fn hex(&self) -> HexSlice<'_>;
-}
-
-impl<T> HexDisplayExt for T
-where
-    T: ?Sized + AsRef<[u8]>,
-{
-    fn hex(&self) -> HexSlice<'_> {
-        HexSlice::new(self)
-    }
-}
+use crate::router::hex::HexDisplayExt;
 
 /// The identity service stores a read-only, global copy of SKI's setup,
 /// including the network's root certificate authority and router's key and
@@ -61,6 +30,7 @@ pub struct RouterIdentityService {
     ca: Certificate,
 }
 
+#[derive(Debug)]
 pub enum Error {
     KeyDoesNotMatchCertificate,
     CertificateNotSignedByCA,
@@ -133,6 +103,40 @@ pub struct Certificate {
     pub tags: Vec<String>,
 }
 
+impl std::fmt::Display for Certificate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // write all fields
+        write!(f, "Certificate {{")?;
+        write!(f, "hosts: {{")?;
+        for (host, ports) in &self.hosts {
+            write!(f, "{:?}: ", host)?;
+            if ports.is_empty() {
+                write!(f, "all ports")?;
+            } else {
+                write!(f, "[")?;
+                for port in ports {
+                    write!(f, "{}, ", port)?;
+                }
+                write!(f, "]")?;
+            }
+        }
+        write!(f, "}}, ")?;
+        write!(f, "human_readable_name: {}, ", self.human_readable_name)?;
+        write!(f, "id: {}, ", self.id.hex())?;
+        write!(f, "tags: [")?;
+        for tag in &self.tags {
+            write!(f, "{}, ", tag)?;
+        }
+        write!(f, "]}}")
+    }
+}
+
+impl std::fmt::Debug for Certificate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
 impl Certificate {
     /// Returns true if the signature is valid for this challenge against the
     /// certificate.
@@ -148,7 +152,7 @@ impl Certificate {
     /// certificate.
     pub fn validate_identity(&self, identity: &ServiceIdentity) -> bool {
         // todo: we should be able to validate this without re-serializing it
-        let cert = match to_bytes::<_, 1024>(identity) {
+        let cert = match to_bytes::<_, 1024>(&identity.cert) {
             Ok(c) => c,
             Err(_) => return false,
         };
@@ -197,7 +201,7 @@ impl Certificate {
     }
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone)]
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 #[archive(check_bytes)]
 /// A service identity is a certificate that has been signed by a certificate
 /// authority. This is what is transmitted over the wire.
@@ -208,7 +212,9 @@ pub struct ServiceIdentity {
     pub signature: Signature,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Hash, Eq, PartialEq)]
+#[derive(
+    Archive, Serialize, Deserialize, Clone, Hash, Eq, PartialEq, Debug,
+)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Hash, Eq, PartialEq))]
 /// A host is an IP address or domain name.
@@ -226,5 +232,11 @@ pub struct Challenge([u8; 32]);
 impl Challenge {
     pub fn new() -> Self {
         Self(rand::random())
+    }
+}
+
+impl std::fmt::Debug for Challenge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Challenge").field(&self.0.hex()).finish()
     }
 }

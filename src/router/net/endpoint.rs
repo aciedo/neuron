@@ -10,11 +10,12 @@ use hashbrown::HashMap;
 use petgraph::prelude::DiGraphMap;
 use quinn::default_runtime;
 use quinn_proto::{IdleTimeout, VarInt};
-use rustls::{
-    internal::msgs::codec::Codec, server::AllowAnyAuthenticatedClient,
-    Certificate as RustlsCert, PrivateKey,
-};
+use rustls::client::{ServerCertVerified, ServerCertVerifier};
+
 use tokio::sync::{mpsc, RwLock};
+use tracing::debug;
+
+use crate::router::hex::HexDisplayExt;
 
 use super::{
     axon::{Axon, ControlRecvStream, ControlSendStream},
@@ -38,7 +39,7 @@ pub type NetworkGraph = DiGraphMap<ServiceID, LatencyEdge>;
 pub type NewControlStream =
     (Axon, ControlSendStream, ControlRecvStream, ServiceIdentity);
 
-struct Endpoint {
+pub struct Endpoint {
     ep: Arc<quinn::Endpoint>,
     routers: Arc<RwLock<HashMap<ServiceID, ServiceIdentity>>>,
     axons: Arc<RwLock<HashMap<ServiceID, Axon>>>,
@@ -53,8 +54,6 @@ impl Endpoint {
     pub fn new(
         // An IP address to bind to.
         ip_addr: IpAddr,
-        tls_key: &[u8],
-        tls_cert: &[u8],
         // Handles SKI's additional security layer on top of TLS
         id_service: Arc<RouterIdentityService>,
     ) -> io::Result<Self> {
@@ -65,7 +64,7 @@ impl Endpoint {
         })?;
 
         let (client_tls, server_tls) =
-            Self::tls_config(tls_cert, tls_key).unwrap();
+            Self::tls_config(ip_addr.clone()).unwrap();
 
         // shared transport configuration for the server and client sides
         // this is the default config with the BBR congestion controller enabled
@@ -90,8 +89,6 @@ impl Endpoint {
             quinn::Endpoint::new(config, Some(server_config), socket, runtime)?;
         ep.set_default_client_config(client_config);
 
-        let network_graph = Arc::new(RwLock::new(NetworkGraph::new()));
-        let routers = Arc::new(RwLock::new(HashMap::new()));
         let axons = Arc::new(RwLock::new(HashMap::new()));
         let ep = Arc::new(ep);
         let (new_control_streams_tx, new_control_streams_rx) =
@@ -109,9 +106,9 @@ impl Endpoint {
         );
         Ok(Self {
             ep,
-            routers,
+            routers: netwatch.routers().clone(),
             axons,
-            network_graph,
+            network_graph: netwatch.graph().clone(),
             new_control_streams_tx,
             id_service,
         })
@@ -126,6 +123,7 @@ impl Endpoint {
         id_service: Arc<RouterIdentityService>,
         ep: Arc<quinn::Endpoint>,
     ) {
+        debug!("acceptor started");
         while let Some(in_progress) = ep.accept().await {
             let axons = axons.clone();
             let new_control_streams_tx = new_control_streams_tx.clone();
@@ -134,10 +132,16 @@ impl Endpoint {
                 if let Ok((axon, send_stream, recv_stream, identity)) =
                     Axon::new(in_progress, false, id_service).await
                 {
-                    axons
-                        .write()
-                        .await
-                        .insert(identity.cert.id.clone(), axon.clone());
+                    let mut axons = axons.write().await;
+                    if axons.contains_key(&identity.cert.id) {
+                        debug!(
+                            "dropped duplicate axon from {}",
+                            identity.cert.id.hex()
+                        );
+                        return;
+                    }
+                    debug!("accepted axon from {}", identity.cert.id.hex());
+                    axons.insert(identity.cert.id.clone(), axon.clone());
                     new_control_streams_tx
                         .send((axon, send_stream, recv_stream, identity))
                         .expect("netwatch isn't running");
@@ -170,45 +174,64 @@ impl Endpoint {
     /// Returns rustls configurations using SKI's root CA.
     /// Both client and server validate each other using the root CA.
     fn tls_config(
-        cert: &[u8],
-        key: &[u8],
+        ip_addr: IpAddr,
     ) -> Result<(rustls::ClientConfig, rustls::ServerConfig), rustls::Error>
     {
-        let root_ca = RustlsCert::read_bytes(SKI_ROOT_CA)?;
+        let root_ca = {
+            let mut certs = rustls_pemfile::certs(&mut BufReader::new(
+                Cursor::new(SKI_ROOT_CA),
+            ))
+            .unwrap();
+            if certs.len() != 1 {
+                panic!("expected exactly one certificate");
+            }
+            rustls::Certificate(certs.remove(0))
+        };
         let mut root_certs = rustls::RootCertStore::empty();
         root_certs.add(&root_ca)?;
 
-        let cert = RustlsCert::read_bytes(cert)?;
-        let key = {
-            let mut keys = rustls_pemfile::pkcs8_private_keys(
-                &mut BufReader::new(Cursor::new(key)),
-            )
-            .unwrap();
-            if keys.len() != 1 {
-                panic!("expected exactly one private key");
-            }
-            keys.remove(0)
-        };
+        let self_signed_cert =
+            rcgen::generate_simple_self_signed([ip_addr.to_string()]).unwrap();
+
+        let cert =
+            rustls::Certificate(self_signed_cert.serialize_der().unwrap());
+
+        let key =
+            rustls::PrivateKey(self_signed_cert.serialize_private_key_der());
 
         let client_config = rustls::ClientConfig::builder()
             .with_safe_defaults()
-            .with_root_certificates(root_certs.clone())
-            .with_client_auth_cert(
-                vec![cert.clone()],
-                PrivateKey(key.clone()),
-            )?;
+            // .with_root_certificates(root_certs.clone())
+            .with_custom_certificate_verifier(Arc::new(
+                NoCertificateVerification {},
+            ))
+            // .with_client_auth_cert(vec![cert.clone()], key.clone())?;
+            .with_no_client_auth();
 
         let server_config = rustls::ServerConfig::builder()
             .with_safe_defaults()
-            .with_client_cert_verifier(
-                // TODO: use a custom verifier that checks the client's
-                // RustlsCert against the root CA, including host name, role
-                // checks etc ensure that the client is an
-                // actual neuron router
-                AllowAnyAuthenticatedClient::new(root_certs).boxed(),
-            )
-            .with_single_cert(vec![cert], PrivateKey(key))?;
+            // .with_client_cert_verifier(
+            //     AllowAnyAuthenticatedClient::new(root_certs).boxed(),
+            // )
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)?;
 
         Ok((client_config, server_config))
+    }
+}
+
+pub struct NoCertificateVerification {}
+
+impl ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::Certificate,
+        _intermediates: &[rustls::Certificate],
+        _server_name: &rustls::ServerName,
+        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _ocsp_response: &[u8],
+        _now: std::time::SystemTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
     }
 }

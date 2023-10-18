@@ -1,4 +1,5 @@
-mod net;
+pub mod hex;
+pub mod net;
 
 // As consensus happens at a partition level rather than a topic level, each
 // partition gets its own task. NEURON's implementation considers locks to slow

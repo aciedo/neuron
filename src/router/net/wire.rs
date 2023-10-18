@@ -18,7 +18,22 @@ pub struct SignedControlMessage {
     pub forwarded_from: Option<ServiceID>,
 }
 
-#[derive(Archive, Serialize, Deserialize)]
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+#[archive(check_bytes)]
+struct MyIdentityAndAChallengeForYou {
+    identity: ServiceIdentity,
+    signature: Signature,
+    challenge: Challenge,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+#[archive(check_bytes)]
+struct MyIdentity {
+    identity: ServiceIdentity,
+    signature: Signature,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 #[archive(check_bytes)]
 /// Messages sent between routers during their Axon handshake
 pub enum HandshakeMessage {
@@ -34,7 +49,7 @@ pub enum HandshakeMessage {
 
 impl HandshakeMessage {
     pub fn encode(&self) -> Option<AlignedVec> {
-        Some(to_bytes::<_, 4096>(self).ok()?)
+        to_bytes::<_, 4096>(self).ok()
     }
 
     pub fn decode(buf: &[u8]) -> Option<Self> {
@@ -42,7 +57,38 @@ impl HandshakeMessage {
     }
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone)]
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+#[archive(check_bytes)]
+struct NewRouter {
+    identity: ServiceIdentity,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+#[archive(check_bytes)]
+struct DeadRouter {
+    id: ServiceID,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+#[archive(check_bytes)]
+struct Rtt {
+    id: ServiceID,
+    rtt: u128,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+#[archive(check_bytes)]
+struct WhoIs {
+    id: ServiceID,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+#[archive(check_bytes)]
+struct ServiceIDMatched {
+    identity: ServiceIdentity,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 #[archive(check_bytes)]
 pub enum ControlMessage {
     /// A new router has joined the network
@@ -51,7 +97,7 @@ pub enum ControlMessage {
     DeadRouter(ServiceID),
     /// A microsecond precision RTT (round-trip-time) measurement from the
     /// broadcasting to another router
-    RTT(ServiceID, u128),
+    Rtt(ServiceID, u128),
     /// A query asking for the identity of a router with a given ID.
     /// Sometimes routers will receive messages for peers that they don't know
     /// about
@@ -62,7 +108,7 @@ pub enum ControlMessage {
 
 impl ControlMessage {
     pub fn encode(&self) -> Option<AlignedVec> {
-        Some(to_bytes::<_, 4096>(self).ok()?)
+        to_bytes::<_, 4096>(self).ok()
     }
 
     pub fn decode(buf: &[u8]) -> Option<Self> {

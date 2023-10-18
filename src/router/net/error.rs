@@ -5,6 +5,7 @@ use quinn_proto::{ConnectError, ConnectionError};
 
 use super::wire::{ControlMessage, HandshakeMessage};
 
+#[derive(Debug)]
 pub enum Error {
     ConnectError(ConnectError),
     ConnectionError(ConnectionError),
