@@ -15,7 +15,7 @@ use kt2::{PublicKey, SecretKey, Signature};
 use rkyv::{to_bytes, Archive, Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 
-pub type ServiceID = [u8; 32];
+pub type ServiceID = [u8; 4];
 
 use std::net::SocketAddr;
 
@@ -93,8 +93,8 @@ pub struct Certificate {
     pub hosts: HashMap<Host, HashSet<u16>>,
     /// The human readable name of the certificate.
     pub human_readable_name: String,
-    /// A digest of the certificate's public key.
-    pub id: [u8; 32],
+    /// A deterministic ID for the certificate based on the public key.
+    pub id: ServiceID,
     /// The public key of the certificate.
     pub public_key: PublicKey,
     /// A list of tags that this certificate is valid for. These will usually
@@ -177,7 +177,7 @@ impl Certificate {
     /// Returns true if the hash of the public key matches the certificate's
     /// ID.
     pub fn validate_self_id(&self) -> bool {
-        *hash(&self.public_key.bytes).as_bytes() == self.id
+        hash(&self.public_key.bytes).as_bytes()[0..4] == self.id
     }
 
     /// Returns true if this certificate is valid for any of the provided tags.
@@ -227,7 +227,7 @@ pub enum Host {
 /// A service signs a challenge to prove that it owns a certificate.
 #[derive(Archive, Serialize, Deserialize, Clone)]
 #[archive(check_bytes)]
-pub struct Challenge([u8; 32]);
+pub struct Challenge(pub [u8; 32]);
 
 impl Challenge {
     pub fn new() -> Self {

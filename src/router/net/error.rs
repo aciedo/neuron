@@ -3,7 +3,7 @@ use std::io;
 use quinn::{ReadExactError, ReadToEndError, WriteError};
 use quinn_proto::{ConnectError, ConnectionError};
 
-use super::wire::{ControlMessage, HandshakeMessage};
+use super::wire::MessageType;
 
 #[derive(Debug)]
 pub enum Error {
@@ -13,8 +13,10 @@ pub enum Error {
     WriteError(WriteError),
     ReadExactError(ReadExactError),
     ReadToEndError(ReadToEndError),
-    ReceivedBadHandshakeMessage(HandshakeMessage),
-    ReceivedBadControlMessage(ControlMessage),
+    ReceivedUnexpectedMessageType {
+        wanted: MessageType,
+        got: MessageType,
+    },
     PeerSignatureDidNotMatchChallengeGiven,
     PeerCertNotSignedByCA,
     PeerCertDoesNotIncludeTheirAddr,

@@ -21,7 +21,7 @@ async fn main() {
     let root_ca = Certificate::builder()
         .hosts(HashMap::new())
         .human_readable_name("root-ca".into())
-        .id(hash(&ca_pk.bytes).into())
+        .id(hash(&ca_pk.bytes).as_bytes()[0..4].try_into().unwrap())
         .public_key(ca_pk)
         .tags(vec![])
         .build();
@@ -33,7 +33,7 @@ async fn main() {
         let cert = Certificate::builder()
             .hosts(hosts)
             .human_readable_name("test".into())
-            .id(hash(&public.bytes).into())
+            .id(hash(&public.bytes).as_bytes()[0..4].try_into().unwrap())
             .public_key(public)
             .tags(vec![])
             .build();
@@ -57,7 +57,7 @@ async fn main() {
         let cert = Certificate::builder()
             .hosts(hosts)
             .human_readable_name("test".into())
-            .id(hash(&public.bytes).into())
+            .id(hash(&public.bytes).as_bytes()[0..4].try_into().unwrap())
             .public_key(public)
             .tags(vec![])
             .build();

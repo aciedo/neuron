@@ -1,6 +1,7 @@
 use std::{
     cmp::Reverse,
     collections::BinaryHeap,
+    io::Read,
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -9,24 +10,29 @@ use byteorder::{ByteOrder, LittleEndian};
 use chrono::{NaiveDateTime, TimeZone, Utc};
 use hashbrown::{HashMap, HashSet};
 use petgraph::{prelude::GraphMap, Directed};
-use rkyv::AlignedVec;
+use rkyv::{
+    ser::serializers::{
+        AlignedSerializer, AllocScratch, CompositeSerializer, FallbackScratch,
+        HeapScratch, SharedSerializeMap,
+    },
+    AlignedVec, Serialize,
+};
 use tokio::{
     select,
     sync::{mpsc, RwLock},
 };
 use tracing::{debug, debug_span, warn};
+use zstd::Decoder;
 
-use crate::router::{
-    hex::HexDisplayExt,
-    net::{endpoint::LatencyEdge, wire::ControlMessage},
-};
+use crate::router::{hex::HexDisplayExt, net::endpoint::LatencyEdge};
+use rkyv::from_bytes;
 
 use super::{
     axon::ControlSendStream,
     endpoint::{NetworkGraph, NewControlStream},
     error::Error,
     ski::{RouterIdentityService, ServiceID, ServiceIdentity},
-    wire::{ControlMessage::*, MessageID, SignedControlMessage},
+    wire::{MessageID, MessageType, SignedControlMessage},
 };
 
 pub struct NetWatch {
@@ -117,7 +123,7 @@ impl NetWatch {
                         rtt: rtt.as_micros(),
                         last_updated: Utc::now(),
                     });
-                    Self::send_to_peers(&mut stream_senders, Rtt(peer_id, rtt.as_micros()), |_| true, None, &error_tx).await;
+                    Self::send_to_peers(&mut stream_senders, MessageType::Rtt, &(peer_id, rtt.as_micros()), |_| true, None, &error_tx).await;
                 }
                 Some((peer_id, signed_msg)) = new_msg_rx.recv() => {
                     let mut msg_id = [0u8; 8];
@@ -155,31 +161,48 @@ impl NetWatch {
                         queued_messages.entry(origin.clone()).or_insert(Vec::new()).push(signed_msg);
                         if !pending_whois_requests.contains(&origin) {
                             pending_whois_requests.insert(origin.clone());
-                            Self::send_to_peers(&mut stream_senders, WhoIs(origin), |peer_id| peer_id != &origin, None, &error_tx).await;
+                            Self::send_to_peers(&mut stream_senders, MessageType::WhoIs, &origin, |peer_id| peer_id != &origin, None, &error_tx).await;
                         }
                         continue;
                     }
 
                     let sent_at = LittleEndian::read_i64(&signed_msg.buf.0[0..8]);
 
-                    // realign message to 16-byte boundary
-                    let msg = {
-                        let mut aligned = AlignedVec::new();
-                        aligned.extend_from_slice(&signed_msg.buf.0[12..]);
+                    // decompress and realign message to 16-byte boundary
+                    let msg = tokio::task::spawn_blocking(move || {
+                        const INC: usize = 512;
+                        let mut decompressor = Decoder::new(&signed_msg.buf.0[12..]).unwrap();
+                        let mut free = INC;
+                        let mut aligned = AlignedVec::with_capacity(free);
+                        aligned.resize(free, 0);
+                        let mut i = 0;
+                        loop {
+                            let read = decompressor.read(&mut aligned[i..]).unwrap();
+                            if read == 0 {
+                                break;
+                            }
+                            free -= read;
+                            i += read;
+                            if free == 0 {
+                                aligned.reserve(INC);
+                                aligned.resize(i + INC, 0);
+                                free = INC;
+                            }
+                        }
+                        aligned.resize(i, 0);
                         aligned
-                    };
+                    }).await.unwrap();
 
-                    let msg = match ControlMessage::decode(&msg) {
-                        Some(msg) => msg,
-                        None => {
-                            warn!("Received a message from peer {} that could not be decoded. Ignoring.",
-                                peer_id.hex());
-                            continue;
-                        },
-                    };
-
-                    match msg {
-                        ControlMessage::NewRouter(identity) => {
+                    match signed_msg.msg_type {
+                        MessageType::NewRouter => {
+                            let identity: ServiceIdentity = match from_bytes(&msg).ok() {
+                                Some(identity) => identity,
+                                None => {
+                                    warn!("Received a NewRouter message from peer {} that could not be deserialized. Ignoring.",
+                                        peer_id.hex());
+                                    continue;
+                                }
+                            };
                             if self.routers.read().await.contains_key(&identity.cert.id) {
                                 warn!("Received a NewRouter message from peer {} for peer {} that we already know about. Ignoring.",
                                     peer_id.hex(), identity.cert.id.hex());
@@ -209,9 +232,17 @@ impl NetWatch {
                             );
 
                             debug!("Added new router {} from peer {}", identity.cert.id.hex(), peer_id.hex());
-                            Self::send_to_peers(&mut stream_senders, NewRouter(identity), |id| id != &origin && id != &peer_id, Some(origin), &error_tx).await;
+                            Self::send_to_peers_raw(&mut stream_senders, MessageType::NewRouter, msg, |id| id != &origin && id != &peer_id, Some(origin), &error_tx).await;
                         },
-                        ControlMessage::DeadRouter(id) => {
+                        MessageType::DeadRouter => {
+                            let id: ServiceID = match from_bytes(&msg).ok() {
+                                Some(id) => id,
+                                None => {
+                                    warn!("Received a DeadRouter message from peer {} that could not be deserialized. Ignoring.",
+                                        peer_id.hex());
+                                    continue;
+                                }
+                            };
                             tokio::join!(
                                 async {
                                     self.routers.write().await.remove(&id);
@@ -224,9 +255,17 @@ impl NetWatch {
                             pending_whois_requests.remove(&id);
                             queued_messages.remove(&id);
                             debug!("Removed dead router {}", id.hex());
-                            Self::send_to_peers(&mut stream_senders, msg, |id| id != &origin && id != &peer_id, Some(origin), &error_tx).await;
+                            Self::send_to_peers_raw(&mut stream_senders, MessageType::DeadRouter, msg, |id| id != &origin && id != &peer_id, Some(origin), &error_tx).await;
                         },
-                        ControlMessage::Rtt(target, new_rtt) => {
+                        MessageType::Rtt => {
+                            let (target, new_rtt) = match from_bytes(&msg).ok() {
+                                Some(o) => o,
+                                None => {
+                                    warn!("Received an RTT message from peer {} that could not be deserialized. Ignoring.",
+                                        peer_id.hex());
+                                    continue;
+                                }
+                            };
                             let timestamp = Utc.from_utc_datetime(&match NaiveDateTime::from_timestamp_micros(sent_at) {
                                 Some(a) => a,
                                 None => {
@@ -252,32 +291,48 @@ impl NetWatch {
                             };
 
                             if let Some(old_edge) = graph.add_edge(origin, target, new_edge.clone()) {
-                                debug!("Updated RTT from peer {} to peer {} from {}µs to {}µs",
+                                debug!("Update RTT {} -> {} from {}µs to {}µs",
                                     origin.hex(), target.hex(), old_edge.rtt, new_edge.rtt);
                             } else {
-                                debug!("Added RTT of {}µs from peer {} to peer {}",
-                                    new_edge.rtt, origin.hex(), target.hex());
+                                debug!("Added RTT {} -> {} of {}µs",
+                                     origin.hex(), target.hex(), new_edge.rtt);
                             }
                             drop(graph);
-                            Self::send_to_peers(&mut stream_senders, msg, |id| id != &origin && id != &peer_id, Some(origin), &error_tx).await;
+                            Self::send_to_peers_raw(&mut stream_senders, MessageType::Rtt, msg, |id| id != &origin && id != &peer_id, Some(origin), &error_tx).await;
                         },
-                        ControlMessage::WhoIs(whois_id) => {
+                        MessageType::WhoIs => {
+                            let whois_id: ServiceID = match from_bytes(&msg).ok() {
+                                Some(id) => id,
+                                None => {
+                                    warn!("Received a WhoIs message from peer {} that could not be deserialized. Ignoring.",
+                                        peer_id.hex());
+                                    continue;
+                                }
+                            };
                             // if we have a router with this id, send its identity to the origin
                             if let Some(identity) = self.routers.read().await.get(&whois_id) {
                                 stream_senders.get_mut(&origin)
                                     .expect("stream sender doesn't exist for a identity in routers")
-                                    .send(ServiceIDMatched(identity.clone()), None).await
+                                    .send(MessageType::ServiceIDMatched, identity, None).await
                                     .or_else(|e| error_tx.send((whois_id, e)))
                                     .expect("netwatch isn't running");
                                 debug!("Sent identity of peer {} to peer {}", whois_id.hex(), origin.hex());
                             } else {
                                 // otherwise, forward the WhoIs message to all peers except the origin and the peer that sent it
-                                Self::send_to_peers(&mut stream_senders, msg, |id| id != &origin && id != &peer_id, Some(origin), &error_tx).await;
+                                Self::send_to_peers_raw(&mut stream_senders, MessageType::WhoIs, msg, |id| id != &origin && id != &peer_id, Some(origin), &error_tx).await;
                                 debug!("Forwarded WhoIs message for peer {} from peer {} to all other peers",
                                     whois_id.hex(), origin.hex());
                             }
                         },
-                        ControlMessage::ServiceIDMatched(identity) => {
+                        MessageType::ServiceIDMatched => {
+                            let identity: ServiceIdentity = match from_bytes(&msg).ok() {
+                                Some(id) => id,
+                                None => {
+                                    warn!("Received a ServiceIDMatched message from peer {} that could not be deserialized. Ignoring.",
+                                        peer_id.hex());
+                                    continue;
+                                }
+                            };
                             if pending_whois_requests.remove(&identity.cert.id) {
                                 if !identity.cert.validate_self_id() {
                                     warn!("Received a ServiceIDMatched message from peer {} for peer {} whose ID didn't match its public key. Ignoring.",
@@ -294,7 +349,8 @@ impl NetWatch {
                                 self.routers.write().await.insert(identity.cert.id, identity);
                             }
                         },
-                    }
+                        _ => continue
+                    };
                 }
                 Some((_peer_id, _error)) = error_rx.recv() => {
 
@@ -304,9 +360,39 @@ impl NetWatch {
     }
 
     /// Sends a message to all peers based on a filter.
-    async fn send_to_peers<F>(
+    async fn send_to_peers<T, F>(
         stream_senders: &mut HashMap<ServiceID, ControlSendStream>,
-        msg: ControlMessage,
+        msg_type: MessageType,
+        msg: &T,
+        filter: F,
+        forwarded_from: Option<ServiceID>,
+        error_tx: &mpsc::UnboundedSender<(ServiceID, Error)>,
+    ) where
+        F: Fn(&ServiceID) -> bool,
+        T: Serialize<
+            CompositeSerializer<
+                AlignedSerializer<AlignedVec>,
+                FallbackScratch<HeapScratch<512>, AllocScratch>,
+                SharedSerializeMap,
+            >,
+        >,
+    {
+        for (peer_id, sender) in stream_senders.iter_mut() {
+            if filter(peer_id) {
+                sender
+                    .send(msg_type.clone(), msg, forwarded_from)
+                    .await
+                    .or_else(|e| error_tx.send((*peer_id, e)))
+                    .expect("netwatch isn't running");
+            }
+        }
+    }
+
+    /// Sends a message to all peers based on a filter.
+    async fn send_to_peers_raw<F>(
+        stream_senders: &mut HashMap<ServiceID, ControlSendStream>,
+        msg_type: MessageType,
+        msg: impl AsRef<[u8]> + Send + 'static + Clone,
         filter: F,
         forwarded_from: Option<ServiceID>,
         error_tx: &mpsc::UnboundedSender<(ServiceID, Error)>,
@@ -316,7 +402,7 @@ impl NetWatch {
         for (peer_id, sender) in stream_senders.iter_mut() {
             if filter(peer_id) {
                 sender
-                    .send(msg.clone(), forwarded_from)
+                    .send_raw_msg(msg_type.clone(), msg.clone(), forwarded_from)
                     .await
                     .or_else(|e| error_tx.send((*peer_id, e)))
                     .expect("netwatch isn't running");
@@ -326,11 +412,11 @@ impl NetWatch {
 
     pub fn graph(
         &self,
-    ) -> Arc<RwLock<GraphMap<[u8; 32], LatencyEdge, Directed>>> {
+    ) -> Arc<RwLock<GraphMap<ServiceID, LatencyEdge, Directed>>> {
         self.graph.clone()
     }
 
-    pub fn routers(&self) -> Arc<RwLock<HashMap<[u8; 32], ServiceIdentity>>> {
+    pub fn routers(&self) -> Arc<RwLock<HashMap<ServiceID, ServiceIdentity>>> {
         self.routers.clone()
     }
 }

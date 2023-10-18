@@ -1,4 +1,3 @@
-use crate::router::net::wire::ControlMessage;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use arrayref::array_ref;
@@ -6,15 +5,24 @@ use byteorder::{ByteOrder, LittleEndian};
 use chrono::Utc;
 use kt2::{Signature, SIGN_BYTES};
 use quinn::{Connecting, RecvStream, SendStream};
+use rkyv::{
+    de::deserializers::SharedDeserializeMap,
+    from_bytes,
+    ser::serializers::{
+        AlignedSerializer, AllocScratch, CompositeSerializer, FallbackScratch,
+        HeapScratch, SharedSerializeMap,
+    },
+    to_bytes,
+    validation::validators::DefaultValidator,
+    AlignedVec, Archive, Deserialize, Serialize,
+};
 use tracing::{debug, debug_span, Instrument};
+use zstd::{decode_all, encode_all as compress};
 
 use super::{
     error::Error::{self, *},
     ski::{Challenge, RouterIdentityService, ServiceID, ServiceIdentity},
-    wire::{
-        HandshakeMessage::{self, *},
-        InnerMessageBuf, SignedControlMessage,
-    },
+    wire::{InnerMessageBuf, MessagePrefix, MessageType, SignedControlMessage},
 };
 
 /// Axons are QUIC backbone links that connect Aciedo's global infrastructure
@@ -56,15 +64,21 @@ impl Axon {
                     let mut hs_send_stream = HandshakeSendStream::new(raw_tx);
                     let mut hs_recv_stream = HandshakeRecvStream::new(raw_rx);
                     let challenge_for_peer = Challenge::new();
-                    let msg = AChallengeForYou(challenge_for_peer.clone());
-                    hs_send_stream.send(msg).await?;
+                    hs_send_stream
+                        .send(
+                            MessageType::AChallengeForYou,
+                            &challenge_for_peer,
+                        )
+                        .await?;
                     debug!("sent challenge to peer");
 
-                    let (peer_identity, sig, challenge_for_me) =
-                        match hs_recv_stream.receive().await? {
-                            MyIdentityAndAChallengeForYou(x) => x,
-                            other => Err(ReceivedBadHandshakeMessage(other))?,
-                        };
+                    let (peer_identity, sig, challenge_for_me): (
+                        ServiceIdentity,
+                        Signature,
+                        Challenge,
+                    ) = hs_recv_stream
+                        .receive(MessageType::MyIdentityAndAChallengeForYou)
+                        .await?;
 
                     debug!("received peer's certificate");
 
@@ -92,24 +106,22 @@ impl Axon {
 
                     let our_sig = id_service.sign_challenge(challenge_for_me);
                     let our_cert = (*id_service.identity()).clone();
-                    let msg = MyIdentity((our_cert, our_sig));
-                    hs_send_stream.send(msg).await?;
+
+                    hs_send_stream
+                        .send(MessageType::MyIdentity, &(our_cert, our_sig))
+                        .await?;
                     debug!("sent our certificate to peer");
 
-                    match hs_recv_stream.receive().await? {
-                        Ready => {
-                            debug!("handshake complete");
-                            (
-                                ControlSendStream::new(
-                                    hs_send_stream,
-                                    id_service.clone(),
-                                ),
-                                ControlRecvStream::new(hs_recv_stream),
-                                peer_identity,
-                            )
-                        }
-                        other => Err(ReceivedBadHandshakeMessage(other))?,
-                    }
+                    hs_recv_stream.receive(MessageType::Ready).await?;
+                    debug!("handshake complete");
+                    (
+                        ControlSendStream::new(
+                            hs_send_stream,
+                            id_service.clone(),
+                        ),
+                        ControlRecvStream::new(hs_recv_stream),
+                        peer_identity,
+                    )
                 } else {
                     // we're on the receiving end of the connection
                     debug!("waiting for peer to open handshake stream");
@@ -120,34 +132,28 @@ impl Axon {
 
                     // First, we expect to receive a challenge from the
                     // initiator
-                    let challenge_for_me =
-                        match hs_recv_stream.receive().await? {
-                            AChallengeForYou(challenge) => challenge,
-                            other => Err(ReceivedBadHandshakeMessage(other))?,
-                        };
+                    let challenge_for_me = hs_recv_stream
+                        .receive(MessageType::AChallengeForYou)
+                        .await?;
                     debug!("received challenge from peer");
 
                     // Then, we sign the challenge and send back our
                     // certificate.
                     let our_cert = (*id_service.identity()).clone();
-                    let our_sig =
-                        id_service.sign_challenge(challenge_for_me.clone());
+                    let our_sig = id_service.sign_challenge(challenge_for_me);
                     let challenge_for_peer = Challenge::new();
-                    let msg = MyIdentityAndAChallengeForYou((
-                        our_cert,
-                        our_sig,
-                        challenge_for_peer.clone(),
-                    ));
-                    hs_send_stream.send(msg).await?;
+                    hs_send_stream
+                        .send(
+                            MessageType::MyIdentityAndAChallengeForYou,
+                            &(our_cert, our_sig, challenge_for_peer.clone()),
+                        )
+                        .await?;
                     debug!("sent our certificate to peer");
 
                     // Finally, we expect to receive a certificate from the
                     // initiator, and validate it
                     let (peer_identity, peer_sig) =
-                        match hs_recv_stream.receive().await? {
-                            MyIdentity((cert, sig)) => (cert, sig),
-                            other => Err(ReceivedBadHandshakeMessage(other))?,
-                        };
+                        hs_recv_stream.receive(MessageType::MyIdentity).await?;
 
                     if !id_service.validate_identity_against_ca(&peer_identity)
                     {
@@ -167,7 +173,7 @@ impl Axon {
 
                     debug!("peer's certificate is valid");
 
-                    hs_send_stream.send(Ready).await?;
+                    hs_send_stream.send(MessageType::Ready, &()).await?;
                     debug!("handshake complete");
 
                     (
@@ -211,10 +217,30 @@ impl HandshakeSendStream {
         Self(stream)
     }
 
-    pub async fn send(&mut self, msg: HandshakeMessage) -> Result<(), Error> {
-        let msg = msg.encode().unwrap();
+    pub async fn send<T>(
+        &mut self,
+        msg_type: MessageType,
+        msg: &T,
+    ) -> Result<(), Error>
+    where
+        T: Archive
+            + Serialize<
+                CompositeSerializer<
+                    AlignedSerializer<AlignedVec>,
+                    FallbackScratch<HeapScratch<512>, AllocScratch>,
+                    SharedSerializeMap,
+                >,
+            >,
+    {
+        let msg = to_bytes(msg).unwrap();
+        let msg =
+            tokio::task::spawn_blocking(move || compress(msg.as_slice(), 0))
+                .await
+                .unwrap()?;
+        let prefix = MessagePrefix::new(false, msg_type);
         let len = msg.len();
-        let mut buf = Vec::with_capacity(4 + len);
+        let mut buf = Vec::with_capacity(1 + 4 + len);
+        buf.push(prefix.into());
         buf.extend_from_slice(&(len as u32).to_le_bytes());
         buf.extend_from_slice(&msg);
         self.0.write_all(&buf).await?;
@@ -229,14 +255,30 @@ impl HandshakeRecvStream {
         Self(stream)
     }
 
-    pub async fn receive(&mut self) -> Result<HandshakeMessage, Error> {
-        let mut len_buf = [0u8; 4];
-        self.0.read_exact(&mut len_buf).await?;
-        let len = u32::from_le_bytes(len_buf);
+    pub async fn receive<T>(
+        &mut self,
+        desired_message_type: MessageType,
+    ) -> Result<T, Error>
+    where
+        T: Archive,
+        <T as Archive>::Archived: for<'a> rkyv::CheckBytes<DefaultValidator<'a>>
+            + Deserialize<T, SharedDeserializeMap>,
+    {
+        let mut prefix_buf = [0u8; 5];
+        self.0.read_exact(&mut prefix_buf).await?;
+        let prefix = MessagePrefix::try_from(prefix_buf[0]).unwrap();
+        let len = LittleEndian::read_u32(&prefix_buf[1..]);
         let mut msg_buf = vec![0u8; len as usize];
         self.0.read_exact(&mut msg_buf).await?;
-        let msg = HandshakeMessage::decode(&msg_buf).unwrap();
-        Ok(msg)
+        let msg = decode_all(msg_buf.as_slice())?;
+        let msg_type = prefix.msg_type();
+        if msg_type != desired_message_type {
+            Err(ReceivedUnexpectedMessageType {
+                wanted: desired_message_type,
+                got: msg_type,
+            })?
+        }
+        Ok(from_bytes(&msg).unwrap())
     }
 }
 
@@ -256,26 +298,54 @@ impl ControlSendStream {
         }
     }
 
-    pub async fn send(
+    pub async fn send<T>(
         &mut self,
-        msg: ControlMessage,
+        msg_type: MessageType,
+        msg: &T,
+        forwarded_from: Option<ServiceID>,
+    ) -> Result<(), Error>
+    where
+        T: Archive
+            + Serialize<
+                CompositeSerializer<
+                    AlignedSerializer<AlignedVec>,
+                    FallbackScratch<HeapScratch<512>, AllocScratch>,
+                    SharedSerializeMap,
+                >,
+            >,
+    {
+        let msg = to_bytes(msg).unwrap();
+        self.send_raw_msg(msg_type, msg, forwarded_from).await
+    }
+
+    pub async fn send_raw_msg(
+        &mut self,
+        msg_type: MessageType,
+        msg: impl AsRef<[u8]> + Send + 'static,
         forwarded_from: Option<ServiceID>,
     ) -> Result<(), Error> {
-        let msg = msg.encode().unwrap();
+        let msg =
+            tokio::task::spawn_blocking(move || compress(msg.as_ref(), 0))
+                .await
+                .unwrap()?;
         let len = msg.len();
+        let prefix = MessagePrefix::new(forwarded_from.is_some(), msg_type);
         let sent_at = Utc::now().timestamp_micros();
         let capacity = 1
             + 8
             + 4
             + len
             + SIGN_BYTES
-            + if forwarded_from.is_some() { 32 } else { 0 };
+            + if forwarded_from.is_some() { 4 } else { 0 };
         let mut buf = Vec::with_capacity(capacity);
-        buf.push(forwarded_from.is_some() as u8); // 1 byte
+        buf.push(prefix.into()); // 1 byte
         buf.extend_from_slice(&sent_at.to_le_bytes()); // 8 bytes
         buf.extend_from_slice(&(len as u32).to_le_bytes()); // 4 bytes
         buf.extend_from_slice(&msg); // len bytes
         buf.extend_from_slice(&self.id_service.sign(&buf[1..]).0); // SIGN_BYTES bytes
+        if let Some(forwarded_from) = forwarded_from {
+            buf.extend_from_slice(&forwarded_from); // 4 bytes
+        }
         self.stream.write_all(&buf).await?;
         Ok(())
     }
@@ -300,12 +370,12 @@ impl ControlRecvStream {
         let mut prefix_buf = [0u8; 1 + 8 + 4];
         self.stream.read(&mut prefix_buf).await.unwrap();
 
-        let forwarded_message = prefix_buf[0] == 1;
+        let prefix = MessagePrefix::from(prefix_buf[0]);
         let msg_len = LittleEndian::read_u32(&prefix_buf[9..]);
 
-        let len_to_read = if forwarded_message {
+        let len_to_read = if prefix.forwarded() {
             msg_len
-                .checked_add(SIGN_BYTES as u32 + 32)
+                .checked_add(SIGN_BYTES as u32 + 4)
                 .ok_or(MessageLengthOverflowed)? as usize
         } else {
             msg_len
@@ -319,8 +389,8 @@ impl ControlRecvStream {
 
         let sig_and_maybe_sid = buf.split_off(8 + 4 + msg_len as usize);
         let sig = Signature(*array_ref![sig_and_maybe_sid, 0, SIGN_BYTES]);
-        let service_id = if forwarded_message {
-            Some(*array_ref![sig_and_maybe_sid, SIGN_BYTES, 32])
+        let service_id = if prefix.forwarded() {
+            Some(*array_ref![sig_and_maybe_sid, SIGN_BYTES, 4])
         } else {
             None
         };
@@ -329,6 +399,7 @@ impl ControlRecvStream {
             buf: InnerMessageBuf(buf),
             signature: sig,
             forwarded_from: service_id,
+            msg_type: prefix.msg_type(),
         })
     }
 }

@@ -1,11 +1,86 @@
 use kt2::Signature;
-use rkyv::{from_bytes, to_bytes, AlignedVec, Archive, Deserialize, Serialize};
+use rkyv::{Archive, Deserialize, Serialize};
 
 use super::ski::{Challenge, ServiceID, ServiceIdentity};
 
+/// Message prefix is 8 bits. The first bit specifies whether the message is
+/// forwarded or not. The last 7 bits specify the message type.
+pub struct MessagePrefix(u8);
+
+impl MessagePrefix {
+    pub fn new(forwarded: bool, msg_type: MessageType) -> Self {
+        Self((forwarded as u8) << 7 | msg_type as u8)
+    }
+
+    pub fn forwarded(&self) -> bool {
+        self.0 >> 7 == 1
+    }
+
+    pub fn msg_type(&self) -> MessageType {
+        MessageType::try_from(self.0 & 0b0111_1111).unwrap()
+    }
+
+    pub fn byte(&self) -> u8 {
+        self.0
+    }
+}
+
+impl From<u8> for MessagePrefix {
+    fn from(byte: u8) -> Self {
+        Self(byte)
+    }
+}
+
+impl From<MessagePrefix> for u8 {
+    fn from(prefix: MessagePrefix) -> Self {
+        prefix.0
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MessageType {
+    // HANDSHAKE MESSAGES
+    /// A challenge for the peer
+    AChallengeForYou,
+    /// The peer's identity and a challenge for this router
+    MyIdentityAndAChallengeForYou,
+    /// This router's identity
+    MyIdentity,
+    /// Handshake complete
+    Ready,
+
+    // CONTROL MESSAGES
+    /// A new router has joined the network
+    NewRouter,
+    /// A router has been detected as dead
+    DeadRouter,
+    /// A microsecond precision RTT (round-trip-time) measurement from the
+    /// broadcasting to another router
+    Rtt,
+    /// A query asking for the identity of a router with a given ID.
+    /// Sometimes routers will receive messages for peers that they don't know
+    /// about
+    WhoIs,
+    /// A response to a WhoIs query from another router
+    ServiceIDMatched,
+}
+
+impl TryFrom<u8> for MessageType {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        if value > 0b0111_1111 {
+            Err(())
+        } else {
+            Ok(unsafe { std::mem::transmute(value) })
+        }
+    }
+}
+
 pub type MessageID = [u8; 8];
 
-/// A buffer containing a sent_at | len | msg concatenation
+/// A buffer containing a sent_at | len | compress(msg) concatenation
 pub struct InnerMessageBuf(pub Vec<u8>);
 
 /// A partially deconstructed wire message
@@ -16,6 +91,8 @@ pub struct SignedControlMessage {
     pub signature: Signature,
     /// the service ID of the router that created this message
     pub forwarded_from: Option<ServiceID>,
+    /// The type of message
+    pub msg_type: MessageType,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
@@ -31,30 +108,6 @@ struct MyIdentityAndAChallengeForYou {
 struct MyIdentity {
     identity: ServiceIdentity,
     signature: Signature,
-}
-
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-#[archive(check_bytes)]
-/// Messages sent between routers during their Axon handshake
-pub enum HandshakeMessage {
-    /// A challenge for the peer
-    AChallengeForYou(Challenge),
-    /// The peer's identity and a challenge for this router
-    MyIdentityAndAChallengeForYou((ServiceIdentity, Signature, Challenge)),
-    /// This router's identity
-    MyIdentity((ServiceIdentity, Signature)),
-    /// Handshake complete
-    Ready,
-}
-
-impl HandshakeMessage {
-    pub fn encode(&self) -> Option<AlignedVec> {
-        to_bytes::<_, 4096>(self).ok()
-    }
-
-    pub fn decode(buf: &[u8]) -> Option<Self> {
-        from_bytes(buf).ok()
-    }
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
@@ -86,32 +139,4 @@ struct WhoIs {
 #[archive(check_bytes)]
 struct ServiceIDMatched {
     identity: ServiceIdentity,
-}
-
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-#[archive(check_bytes)]
-pub enum ControlMessage {
-    /// A new router has joined the network
-    NewRouter(ServiceIdentity),
-    /// A router has been detected as dead
-    DeadRouter(ServiceID),
-    /// A microsecond precision RTT (round-trip-time) measurement from the
-    /// broadcasting to another router
-    Rtt(ServiceID, u128),
-    /// A query asking for the identity of a router with a given ID.
-    /// Sometimes routers will receive messages for peers that they don't know
-    /// about
-    WhoIs(ServiceID),
-    /// A response to a WhoIs query from another router
-    ServiceIDMatched(ServiceIdentity),
-}
-
-impl ControlMessage {
-    pub fn encode(&self) -> Option<AlignedVec> {
-        to_bytes::<_, 4096>(self).ok()
-    }
-
-    pub fn decode(buf: &[u8]) -> Option<Self> {
-        from_bytes(buf).ok()
-    }
 }
