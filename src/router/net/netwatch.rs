@@ -1,3 +1,5 @@
+use crate::router::net::wire::InnerMessageBuf;
+use petgraph::algo::astar;
 use std::{
     cmp::Reverse,
     collections::BinaryHeap,
@@ -9,21 +11,20 @@ use std::{
 use byteorder::{ByteOrder, LittleEndian};
 use chrono::{NaiveDateTime, TimeZone, Utc};
 use hashbrown::{HashMap, HashSet};
-use kt2::Signature;
 use petgraph::{prelude::GraphMap, Directed};
 use rkyv::{
     ser::serializers::{
         AlignedSerializer, AllocScratch, CompositeSerializer, FallbackScratch,
         HeapScratch, SharedSerializeMap,
     },
-    AlignedVec, Serialize,
+    to_bytes, AlignedVec, Serialize,
 };
 use tokio::{
     select,
     sync::{mpsc, RwLock},
 };
-use tracing::{debug, debug_span, warn};
-use zstd::Decoder;
+use tracing::{debug, debug_span, trace, warn};
+use zstd::{encode_all as compress, Decoder};
 
 use crate::router::{hex::HexDisplayExt, net::endpoint::LatencyEdge};
 use rkyv::from_bytes;
@@ -126,11 +127,10 @@ impl NetWatch {
                     });
                     Self::send_to_peers(&mut stream_senders, MessageType::Rtt, &(peer_id, rtt.as_micros()), |_| true, &error_tx).await;
                 }
-                Some((peer_id, signed_msg)) = new_msg_rx.recv() => {
+                Some((peer_id, mut scm)) = new_msg_rx.recv() => {
                     let mut msg_id = [0u8; 8];
-                    msg_id[0..4].copy_from_slice(&signed_msg.buf.0[0..4]);
-                    msg_id[4..8].copy_from_slice(&signed_msg.buf.0[12..16]);
-                    // ignore messages we've already seen in the last 5 minutes
+                    msg_id[0..4].copy_from_slice(&scm.buf.0[0..4]);
+                    msg_id[4..8].copy_from_slice(&scm.buf.0[12..16]);
                     if previously_seen_msg_ids.contains(msg_id) {
                         continue;
                     } else {
@@ -139,7 +139,7 @@ impl NetWatch {
 
                     // the origin is the peer that created the message
                     // it might be different from the peer that forwarded it to us
-                    let origin = match signed_msg.forwarded_from {
+                    let origin = match scm.forwarded_from_origin {
                         Some(originator) => originator,
                         None => peer_id.clone(),
                     };
@@ -150,15 +150,19 @@ impl NetWatch {
                     }
 
                     if let Some(identity) = self.routers.read().await.get(&origin) {
-                        if !identity.cert.public_key.verify(&signed_msg.buf.0, &signed_msg.signature) {
-                            warn!("Received bad signature for a message from peer {} through peer {}. Ignoring.",
-                                origin.hex(), peer_id.hex());
+                        if !identity.cert.public_key.verify(&scm.buf.0, &scm.sig) {
+                            if origin == peer_id {
+                                warn!("Received bad signature for a message from peer {}. Ignoring.", origin.hex());
+                            } else {
+                                warn!("Received bad signature for a message from peer {} through peer {}. Ignoring.",
+                                    origin.hex(), peer_id.hex());
+                            }
                             continue;
                         }
                     } else {
                         debug!("Received a message from unknown peer {} through peer {}. Querying peers for identity of origin.",
                             origin.hex(), peer_id.hex());
-                        queued_messages.entry(origin.clone()).or_insert(Vec::new()).push(signed_msg);
+                        queued_messages.entry(origin.clone()).or_insert(Vec::new()).push(scm);
                         if !pending_whois_requests.contains(&origin) {
                             pending_whois_requests.insert(origin.clone());
                             Self::send_to_peers(&mut stream_senders, MessageType::WhoIs, &origin, |peer_id| peer_id != &origin, &error_tx).await;
@@ -166,12 +170,51 @@ impl NetWatch {
                         continue;
                     }
 
-                    let sent_at = LittleEndian::read_i64(&signed_msg.buf.0[0..8]);
+                    if let Some(destination) = scm.destination {
+                        // just in case the previous hop didn't remove the destination if it was destined for us
+                        if scm.destination != Some(self.id_service.identity().cert.id) {
+                            // don't bother reading the message - it's not for us. we should work out where to send it on its way to the destination
+                            let graph = self.graph.read().await;
+                            let path = astar(&*graph, self.id_service.identity().cert.id, |n| n == destination, |(.., w)| w.rtt, |_| 0);
+                            let next_hop = match path {
+                                Some((est_lat, path)) => {
+                                    debug!("Routing message {}..->{}->{}->{}..{} est. remaining latency ~{}µs",
+                                        origin.hex(), peer_id.hex(), self.id_service.identity().cert.id.hex(), path[1].hex(), destination.hex(), est_lat);
+                                    path[1]
+                                },
+                                None => {
+                                    warn!("No route to destination {} for message {}..->{}->{}..{}",
+                                        destination.hex(), origin.hex(), peer_id.hex(), self.id_service.identity().cert.id.hex(), destination.hex());
+                                    continue;
+                                }
+                            };
+
+                            if next_hop == destination {
+                                scm.destination = None;
+                            }
+
+                            if scm.forwarded_from_origin.is_none() {
+                                scm.forwarded_from_origin = Some(origin);
+                            }
+
+                            stream_senders
+                                .get_mut(&next_hop)
+                                .expect("no stream for next hop")
+                                .send_scm(scm)
+                                .await.expect("netwatch isn't running");
+                            continue;
+                        }
+                    }
+
+                    let sent_at = LittleEndian::read_i64(&scm.buf.0[0..8]);
+
+                    let mut buf = Vec::with_capacity((&scm.buf.0).len() - 12);
+                    buf.extend_from_slice(&scm.buf.0[12..]);
 
                     // decompress and realign message to 16-byte boundary
                     let msg = tokio::task::spawn_blocking(move || {
                         const INC: usize = 512;
-                        let mut decompressor = Decoder::new(&signed_msg.buf.0[12..]).unwrap();
+                        let mut decompressor = Decoder::new(buf.as_slice()).unwrap();
                         let mut free = INC;
                         let mut aligned = AlignedVec::with_capacity(free);
                         aligned.resize(free, 0);
@@ -193,7 +236,7 @@ impl NetWatch {
                         aligned
                     }).await.unwrap();
 
-                    match signed_msg.msg_type {
+                    match scm.msg_type {
                         MessageType::NewRouter => {
                             let identity: ServiceIdentity = match from_bytes(&msg).ok() {
                                 Some(identity) => identity,
@@ -232,7 +275,7 @@ impl NetWatch {
                             );
 
                             debug!("Added new router {} from peer {}", identity.cert.id.hex(), peer_id.hex());
-                            Self::forward_to_peers_raw(&mut stream_senders, MessageType::NewRouter, msg, |id| id != &origin && id != &peer_id, Some((sent_at, origin, signed_msg.signature)), &error_tx).await;
+                            Self::fwd_scm(&mut stream_senders, scm, |id| id != &origin && id != &peer_id, &error_tx).await;
                         },
                         MessageType::DeadRouter => {
                             let id: ServiceID = match from_bytes(&msg).ok() {
@@ -255,7 +298,7 @@ impl NetWatch {
                             pending_whois_requests.remove(&id);
                             queued_messages.remove(&id);
                             debug!("Removed dead router {}", id.hex());
-                            Self::forward_to_peers_raw(&mut stream_senders, MessageType::DeadRouter, msg, |id| id != &origin && id != &peer_id, Some((sent_at, origin, signed_msg.signature)), &error_tx).await;
+                            Self::fwd_scm(&mut stream_senders, scm, |id| id != &origin && id != &peer_id, &error_tx).await;
                         },
                         MessageType::Rtt => {
                             let (target, new_rtt) = match from_bytes(&msg).ok() {
@@ -289,14 +332,21 @@ impl NetWatch {
                             };
 
                             if let Some(old_edge) = graph.add_edge(origin, target, new_edge.clone()) {
-                                debug!("Update RTT {} -> {} from {}µs to {}µs",
+                                trace!("Update RTT {} -> {} from {}µs to {}µs",
                                     origin.hex(), target.hex(), old_edge.rtt, new_edge.rtt);
                             } else {
-                                debug!("Added RTT {} -> {} of {}µs",
+                                trace!("Added RTT {} -> {} of {}µs",
                                      origin.hex(), target.hex(), new_edge.rtt);
                             }
                             drop(graph);
-                            Self::forward_to_peers_raw(&mut stream_senders, MessageType::Rtt, msg, |id| id != &origin && id != &peer_id, Some((sent_at, origin, signed_msg.signature)), &error_tx).await;
+                            trace!("Forwarding RTT message {} from {} to other peers",
+                               msg_id.hex(), origin.hex());
+
+                            if scm.forwarded_from_origin.is_none() {
+                                scm.forwarded_from_origin = Some(origin);
+                            }
+
+                            Self::fwd_scm(&mut stream_senders, scm, |id| id != &origin && id != &peer_id, &error_tx).await;
                         },
                         MessageType::WhoIs => {
                             let whois_id: ServiceID = match from_bytes(&msg).ok() {
@@ -307,24 +357,70 @@ impl NetWatch {
                                     continue;
                                 }
                             };
-                            // if we have a router with this id, send its identity to the origin
-                            if let Some(identity) = self.routers.read().await.get(&whois_id) {
-                                match stream_senders.get_mut(&origin) {
-                                    Some(s) => s,
-                                    None => {
-                                        // we should find a path using the graph and forward it to the first hop so they
-                                        // can continue sending it
-                                        todo!()
-                                    }
-                                }
+                            // if we have a router with this id, or we are this id, send it back
+                            let mut identity = self.routers.read().await.get(&whois_id).map(|i| i.clone());
+                            if identity.is_none() && whois_id == self.id_service.identity().cert.id {
+                                identity = Some(self.id_service.identity().clone());
+                            }
 
-                                    .send(MessageType::ServiceIDMatched, identity).await
+                            if let Some(ref identity) = identity {
+                                if let Some(s) = stream_senders.get_mut(&origin) {
+                                    // we have the identity and a direct connection to the origin
+                                    s.send(MessageType::ServiceIDMatched, identity).await
                                     .or_else(|e| error_tx.send((whois_id, e)))
                                     .expect("netwatch isn't running");
+                                } else {
+                                    // we have the identity but no direct connection, so bounce it through our peers
+                                    let graph = self.graph.read().await;
+                                    let path = astar(&*graph, self.id_service.identity().cert.id, |n| n == origin, |(.., w)| w.rtt, |_| 0);
+
+                                    let next_hop = match path {
+                                        Some((est_lat, path)) => {
+                                            trace!("Sending ServiceIDMatched message for {} through {}->{}..{} est. remaining latency ~{}µs",
+                                                whois_id.hex(), self.id_service.identity().cert.id.hex(), path[1].hex(), origin.hex(), est_lat);
+                                            path[1]
+                                        },
+                                        None => {
+                                            warn!("No route to respond with ServiceIDMatched message for peer {} from peer {}",
+                                                whois_id.hex(), origin.hex());
+                                            continue;
+                                        }
+                                    };
+
+                                    let sent_at = Utc::now().timestamp_micros();
+                                    let mut msg = compress(to_bytes::<_, 1024>(identity).unwrap().as_ref(), 0).unwrap();
+                                    let len = msg.len() as u32;
+                                    let mut buf = Vec::with_capacity(8 + 4 + msg.len());
+                                    buf.extend_from_slice(&sent_at.to_le_bytes());
+                                    buf.extend_from_slice(&len.to_le_bytes());
+                                    buf.append(&mut msg);
+
+                                    let mut scm = SignedControlMessage {
+                                        msg_type: MessageType::ServiceIDMatched,
+                                        buf: InnerMessageBuf(msg),
+                                        sig: self.id_service.sign(&buf),
+                                        forwarded_from_origin: None,
+                                        destination: Some(origin),
+                                    };
+
+                                    if next_hop == origin {
+                                        scm.destination = None;
+                                    }
+
+                                    stream_senders
+                                        .get_mut(&next_hop)
+                                        .expect("no stream for next hop")
+                                        .send_scm(scm)
+                                        .await.expect("netwatch isn't running");
+                                    continue;
+                                }
                                 debug!("Sent identity of peer {} to peer {}", whois_id.hex(), origin.hex());
                             } else {
                                 // otherwise, forward the WhoIs message to all peers except the origin and the peer that sent it
-                                Self::forward_to_peers_raw(&mut stream_senders, MessageType::WhoIs, msg, |id| id != &origin && id != &peer_id, Some((sent_at, origin, signed_msg.signature)), &error_tx).await;
+                                if scm.forwarded_from_origin.is_none() {
+                                    scm.forwarded_from_origin = Some(origin);
+                                }
+                                Self::fwd_scm(&mut stream_senders, scm, |id| id != &origin && id != &peer_id, &error_tx).await;
                                 debug!("Forwarded WhoIs message for peer {} from peer {} to all other peers",
                                     whois_id.hex(), origin.hex());
                             }
@@ -357,8 +453,8 @@ impl NetWatch {
                         _ => continue
                     };
                 }
-                Some((_peer_id, _error)) = error_rx.recv() => {
-
+                Some((peer_id, error)) = error_rx.recv() => {
+                    panic!("Error from peer {}: {:?}", peer_id.hex(), error);
                 }
             }
         }
@@ -392,25 +488,27 @@ impl NetWatch {
         }
     }
 
-    /// Sends a message to all peers based on a filter.
-    async fn forward_to_peers_raw<F>(
+    /// Sends a SCM to all peers based on a filter.
+    async fn fwd_scm<F>(
         stream_senders: &mut HashMap<ServiceID, ControlSendStream>,
-        msg_type: MessageType,
-        msg: impl AsRef<[u8]> + Send + 'static + Clone,
+        scm: SignedControlMessage,
         filter: F,
-        forwarded_from: Option<(i64, ServiceID, Signature)>,
         error_tx: &mpsc::UnboundedSender<(ServiceID, Error)>,
     ) where
         F: Fn(&ServiceID) -> bool,
     {
+        let mut msg_id = [0u8; 8];
+        msg_id[0..4].copy_from_slice(&scm.buf.0[0..4]);
+        msg_id[4..8].copy_from_slice(&scm.buf.0[12..16]);
         for (peer_id, sender) in stream_senders.iter_mut() {
             if filter(peer_id) {
+                debug!(
+                    "Forwarding SCM {} to peer {}",
+                    msg_id.hex(),
+                    peer_id.hex()
+                );
                 sender
-                    .send_raw_msg(
-                        msg_type.clone(),
-                        msg.clone(),
-                        forwarded_from.clone(),
-                    )
+                    .send_scm(scm.clone())
                     .await
                     .or_else(|e| error_tx.send((*peer_id, e)))
                     .expect("netwatch isn't running");

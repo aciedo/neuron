@@ -17,11 +17,11 @@ use rkyv::{
     AlignedVec, Archive, Deserialize, Serialize,
 };
 use tracing::{debug, debug_span, Instrument};
-use zstd::{decode_all, encode_all as compress};
+use zstd::{decode_all as decompress, encode_all as compress};
 
 use super::{
     error::Error::{self, *},
-    ski::{Challenge, RouterIdentityService, ServiceID, ServiceIdentity},
+    ski::{Challenge, RouterIdentityService, ServiceIdentity},
     wire::{InnerMessageBuf, MessagePrefix, MessageType, SignedControlMessage},
 };
 
@@ -237,7 +237,7 @@ impl HandshakeSendStream {
             tokio::task::spawn_blocking(move || compress(msg.as_slice(), 0))
                 .await
                 .unwrap()?;
-        let prefix = MessagePrefix::new(false, msg_type);
+        let prefix = MessagePrefix::new(false, false, msg_type);
         let len = msg.len();
         let mut buf = Vec::with_capacity(1 + 4 + len);
         buf.push(prefix.into());
@@ -270,7 +270,7 @@ impl HandshakeRecvStream {
         let len = LittleEndian::read_u32(&prefix_buf[1..]);
         let mut msg_buf = vec![0u8; len as usize];
         self.0.read_exact(&mut msg_buf).await?;
-        let msg = decode_all(msg_buf.as_slice())?;
+        let msg = decompress(msg_buf.as_slice())?;
         let msg_type = prefix.msg_type();
         if msg_type != desired_message_type {
             Err(ReceivedUnexpectedMessageType {
@@ -313,41 +313,47 @@ impl ControlSendStream {
                 >,
             >,
     {
-        let msg = to_bytes(msg).unwrap();
-        self.send_raw_msg(msg_type, msg, None).await
+        let mut msg = compress(to_bytes(msg).unwrap().as_ref(), 0)?;
+        let prefix = MessagePrefix::new(false, false, msg_type);
+        let mut buf = Vec::with_capacity(1 + 8 + 4 + msg.len() + SIGN_BYTES);
+        buf.push(prefix.into()); // 1 byte
+        buf.extend_from_slice(&Utc::now().timestamp_micros().to_le_bytes()); // 8 bytes
+        buf.extend_from_slice(&(msg.len() as u32).to_le_bytes()); // 4 bytes
+        buf.append(&mut msg);
+        buf.extend_from_slice(&self.id_service.sign(&buf[1..]).0); // SIGN_BYTES
+        self.stream.write_all(&buf).await?;
+        Ok(())
     }
 
-    pub async fn send_raw_msg(
+    pub async fn send_scm(
         &mut self,
-        msg_type: MessageType,
-        msg: impl AsRef<[u8]> + Send + 'static,
-        forwarded_from: Option<(i64, ServiceID, Signature)>,
+        mut scm: SignedControlMessage,
     ) -> Result<(), Error> {
-        let msg =
-            tokio::task::spawn_blocking(move || compress(msg.as_ref(), 0))
-                .await
-                .unwrap()?;
-        let len = msg.len();
-        let prefix = MessagePrefix::new(forwarded_from.is_some(), msg_type);
-        let capacity = 1
-            + 8
-            + 4
-            + len
-            + SIGN_BYTES
-            + if forwarded_from.is_some() { 4 } else { 0 };
-        let mut buf = Vec::with_capacity(capacity);
+        // scm.buf already is sent_at | len | compress(msg)
+        let prefix = MessagePrefix::new(
+            scm.forwarded_from_origin.is_some(),
+            scm.destination.is_some(),
+            scm.msg_type,
+        );
+
+        let mut buf = Vec::with_capacity(
+            1 + scm.buf.0.len()
+                + SIGN_BYTES
+                + if scm.forwarded_from_origin.is_some() {
+                    4
+                } else {
+                    0
+                }
+                + if scm.destination.is_some() { 4 } else { 0 },
+        );
         buf.push(prefix.into()); // 1 byte
-        if let Some((sent_at, forwarded_from, sig)) = forwarded_from {
-            buf.extend_from_slice(&sent_at.to_le_bytes()); // 8 bytes
-            buf.extend_from_slice(&(len as u32).to_le_bytes()); // 4 bytes
-            buf.extend_from_slice(&msg); // len bytes
-            buf.extend_from_slice(&sig.0);
-            buf.extend_from_slice(&forwarded_from); // 4 bytes
-        } else {
-            buf.extend_from_slice(&Utc::now().timestamp_micros().to_le_bytes()); // 8 bytes
-            buf.extend_from_slice(&(len as u32).to_le_bytes()); // 4 bytes
-            buf.extend_from_slice(&msg); // len bytes
-            buf.extend_from_slice(&self.id_service.sign(&buf[1..]).0); // SIGN_BYTES bytes
+        buf.append(&mut scm.buf.0); // sent_at | len | compress(msg)
+        buf.extend_from_slice(&scm.sig.0); // SIGN_BYTES bytes
+        if let Some(forwarded_from_origin) = scm.forwarded_from_origin {
+            buf.extend_from_slice(&forwarded_from_origin); // 4 bytes
+        }
+        if let Some(destination) = scm.destination {
+            buf.extend_from_slice(&destination); // 4 bytes
         }
         self.stream.write_all(&buf).await?;
         Ok(())
@@ -364,27 +370,29 @@ impl ControlRecvStream {
     }
 
     pub async fn recv(&mut self) -> Result<SignedControlMessage, Error> {
-        // forwarded message:
-        // FORWARD_FLAG | sent_at | len | msg | sig | service_id
-        // non-forwarded message:
-        // FORWARD_FLAG | sent_at | len | msg | sig
-
-        // read the forward flag, sent_at, and len
+        // read the msg prefix, sent_at, and len
         let mut prefix_buf = [0u8; 1 + 8 + 4];
         self.stream.read(&mut prefix_buf).await.unwrap();
 
         let prefix = MessagePrefix::from(prefix_buf[0]);
         let msg_len = LittleEndian::read_u32(&prefix_buf[9..]);
 
-        let len_to_read = if prefix.forwarded() {
-            msg_len
-                .checked_add(SIGN_BYTES as u32 + 4)
-                .ok_or(MessageLengthOverflowed)? as usize
-        } else {
-            msg_len
-                .checked_add(SIGN_BYTES as u32)
-                .ok_or(MessageLengthOverflowed)? as usize
-        };
+        let mut len_to_read = msg_len
+            .checked_add(SIGN_BYTES as u32)
+            .ok_or(MessageLengthOverflowed)?
+            as usize;
+
+        if prefix.forwarded() {
+            len_to_read =
+                len_to_read.checked_add(4).ok_or(MessageLengthOverflowed)?
+                    as usize;
+        }
+
+        if prefix.needs_forwarding() {
+            len_to_read =
+                len_to_read.checked_add(4).ok_or(MessageLengthOverflowed)?
+                    as usize;
+        }
 
         let mut buf = vec![0u8; 8 + 4 + len_to_read];
         buf[0..12].copy_from_slice(&prefix_buf[1..]);
@@ -392,17 +400,50 @@ impl ControlRecvStream {
 
         let sig_and_maybe_sid = buf.split_off(8 + 4 + msg_len as usize);
         let sig = Signature(*array_ref![sig_and_maybe_sid, 0, SIGN_BYTES]);
-        let service_id = if prefix.forwarded() {
-            Some(*array_ref![sig_and_maybe_sid, SIGN_BYTES, 4])
-        } else {
-            None
-        };
 
-        Ok(SignedControlMessage {
-            buf: InnerMessageBuf(buf),
-            signature: sig,
-            forwarded_from: service_id,
-            msg_type: prefix.msg_type(),
-        })
+        if prefix.forwarded() {
+            let forwarded_from_origin =
+                array_ref![sig_and_maybe_sid, SIGN_BYTES, 4];
+            if prefix.needs_forwarding() {
+                // message was forwarded, and needs to be forwarded again
+                let destination =
+                    array_ref![sig_and_maybe_sid, SIGN_BYTES + 4, 4];
+                return Ok(SignedControlMessage {
+                    buf: InnerMessageBuf(buf),
+                    sig,
+                    forwarded_from_origin: Some(*forwarded_from_origin),
+                    destination: Some(*destination),
+                    msg_type: prefix.msg_type(),
+                });
+            } else {
+                // message was forwarded to us
+                return Ok(SignedControlMessage {
+                    buf: InnerMessageBuf(buf),
+                    sig,
+                    forwarded_from_origin: Some(*forwarded_from_origin),
+                    destination: None,
+                    msg_type: prefix.msg_type(),
+                });
+            }
+        } else if prefix.needs_forwarding() {
+            let destination = array_ref![sig_and_maybe_sid, SIGN_BYTES, 4];
+            // message was sent directly to us and needs to be forwarded
+            return Ok(SignedControlMessage {
+                buf: InnerMessageBuf(buf),
+                sig,
+                forwarded_from_origin: None,
+                destination: Some(*destination),
+                msg_type: prefix.msg_type(),
+            });
+        } else {
+            // message was sent directly to us
+            return Ok(SignedControlMessage {
+                buf: InnerMessageBuf(buf),
+                sig,
+                forwarded_from_origin: None,
+                destination: None,
+                msg_type: prefix.msg_type(),
+            });
+        }
     }
 }

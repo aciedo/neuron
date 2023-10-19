@@ -1,23 +1,48 @@
 use kt2::Signature;
-use rkyv::{Archive, Deserialize, Serialize};
 
-use super::ski::{Challenge, ServiceID, ServiceIdentity};
+use super::ski::ServiceID;
 
 /// Message prefix is 8 bits. The first bit specifies whether the message is
-/// forwarded or not. The last 7 bits specify the message type.
+/// forwarded or not. The second bit specifies whether the message needs to be
+/// forwarded or not. The last 6 bits specify the message type.
+///
+/// - `needs_forwarding && forwarded` => forwarded message received from a peer,
+///   needs to be forwarded to the next hop
+/// - `needs_forwarding && !forwarded` => one of our peers needs us to forward
+///   this message to the next hop
+/// - `!needs_forwarding && forwarded` => message received from a peer, this is
+///   a message meant for us that has been echoed
+/// - `!needs_forwarding && !forwarded` => message received from a peer meant
+///   for us
 pub struct MessagePrefix(u8);
 
 impl MessagePrefix {
-    pub fn new(forwarded: bool, msg_type: MessageType) -> Self {
-        Self((forwarded as u8) << 7 | msg_type as u8)
+    pub fn new(
+        forwarded: bool,
+        needs_forwarding: bool,
+        msg_type: MessageType,
+    ) -> Self {
+        let mut prefix = 0b0000_0000;
+        if forwarded {
+            prefix |= 0b1000_0000;
+        }
+        if needs_forwarding {
+            prefix |= 0b0100_0000;
+        }
+        prefix |= msg_type as u8;
+        Self(prefix)
     }
 
     pub fn forwarded(&self) -> bool {
-        self.0 >> 7 == 1
+        self.0 & 0b1000_0000 != 0
+    }
+
+    pub fn needs_forwarding(&self) -> bool {
+        self.0 & 0b0100_0000 != 0
     }
 
     pub fn msg_type(&self) -> MessageType {
-        MessageType::try_from(self.0 & 0b0111_1111).unwrap()
+        MessageType::try_from(self.0 & 0b0011_1111).unwrap()
     }
 
     pub fn byte(&self) -> u8 {
@@ -81,62 +106,22 @@ impl TryFrom<u8> for MessageType {
 pub type MessageID = [u8; 8];
 
 /// A buffer containing a sent_at | len | compress(msg) concatenation
+#[derive(Clone)]
 pub struct InnerMessageBuf(pub Vec<u8>);
 
 /// A partially deconstructed wire message
+#[derive(Clone)]
 pub struct SignedControlMessage {
+    /// The type of message
+    pub msg_type: MessageType,
     /// sent_at | len | msg
     pub buf: InnerMessageBuf,
     /// the signature of sent_at | msg.len() | msg
-    pub signature: Signature,
-    /// the service ID of the router that created this message
-    pub forwarded_from: Option<ServiceID>,
-    /// The type of message
-    pub msg_type: MessageType,
-}
-
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-#[archive(check_bytes)]
-struct MyIdentityAndAChallengeForYou {
-    identity: ServiceIdentity,
-    signature: Signature,
-    challenge: Challenge,
-}
-
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-#[archive(check_bytes)]
-struct MyIdentity {
-    identity: ServiceIdentity,
-    signature: Signature,
-}
-
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-#[archive(check_bytes)]
-struct NewRouter {
-    identity: ServiceIdentity,
-}
-
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-#[archive(check_bytes)]
-struct DeadRouter {
-    id: ServiceID,
-}
-
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-#[archive(check_bytes)]
-struct Rtt {
-    id: ServiceID,
-    rtt: u128,
-}
-
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-#[archive(check_bytes)]
-struct WhoIs {
-    id: ServiceID,
-}
-
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-#[archive(check_bytes)]
-struct ServiceIDMatched {
-    identity: ServiceIdentity,
+    pub sig: Signature,
+    /// if `msg_prefix.forwarded()`, the service ID of the router that
+    /// created this message
+    pub forwarded_from_origin: Option<ServiceID>,
+    /// if `msg_prefix.needs_forwarding()`, the service ID of the router that
+    /// should receive this message
+    pub destination: Option<ServiceID>,
 }

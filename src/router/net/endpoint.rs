@@ -13,7 +13,7 @@ use quinn_proto::{IdleTimeout, VarInt};
 use rustls::client::{ServerCertVerified, ServerCertVerifier};
 
 use tokio::sync::{mpsc, RwLock};
-use tracing::debug;
+use tracing::{debug, debug_span, Instrument};
 
 use crate::router::hex::HexDisplayExt;
 
@@ -102,7 +102,11 @@ impl Endpoint {
         let netwatch = Arc::new(NetWatch::new(id_service.clone()));
         let nw_clone = netwatch.clone();
         tokio::spawn(
-            async move { nw_clone.start(new_control_streams_rx).await },
+            async move { nw_clone.start(new_control_streams_rx).await }
+                .instrument(debug_span!(
+                    "nw",
+                    id = %id_service.identity().cert.id.hex()
+                )),
         );
         Ok(Self {
             ep,

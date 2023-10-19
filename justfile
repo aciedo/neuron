@@ -10,7 +10,8 @@ f:
     rustfmt src/**/*.rs
     cargo fix --lib --allow-dirty
 cli:
-    for i in $(seq 2 3); do \
+    for i in $(seq 2 7); do \
         sudo ifconfig lo0 alias 127.0.0.$i up; \
     done
-    sudo RUST_LOG=debug cargo r -p cli
+    cargo b -p cli
+    sudo RUST_LOG=debug ./target/debug/cli

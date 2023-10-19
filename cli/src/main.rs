@@ -16,7 +16,7 @@ use neuron::router::net::ski::{
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    const TOTAL: usize = 3;
+    const TOTAL: usize = 7;
 
     let ca_kp = Keypair::generate(None);
     let ca_pk = ca_kp.public;
