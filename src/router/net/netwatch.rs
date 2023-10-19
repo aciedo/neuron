@@ -3,12 +3,10 @@ use petgraph::algo::astar;
 use std::{
     cmp::Reverse,
     collections::BinaryHeap,
-    io::Read,
     sync::Arc,
     time::{Duration, SystemTime},
 };
 
-use byteorder::{ByteOrder, LittleEndian};
 use chrono::{NaiveDateTime, TimeZone, Utc};
 use hashbrown::{HashMap, HashSet};
 use petgraph::{prelude::GraphMap, Directed};
@@ -17,14 +15,13 @@ use rkyv::{
         AlignedSerializer, AllocScratch, CompositeSerializer, FallbackScratch,
         HeapScratch, SharedSerializeMap,
     },
-    to_bytes, AlignedVec, Serialize,
+    AlignedVec, Serialize,
 };
 use tokio::{
     select,
     sync::{mpsc, RwLock},
 };
-use tracing::{debug, debug_span, trace, warn};
-use zstd::{encode_all as compress, Decoder};
+use tracing::{debug, debug_span, info, trace, warn};
 
 use crate::router::{hex::HexDisplayExt, net::endpoint::LatencyEdge};
 use rkyv::from_bytes;
@@ -131,6 +128,8 @@ impl NetWatch {
                     let mut msg_id = [0u8; 8];
                     msg_id[0..4].copy_from_slice(&scm.buf.0[0..4]);
                     msg_id[4..8].copy_from_slice(&scm.buf.0[12..16]);
+                    // it's often for us to receive the same message multiple times.
+                    // this removes any feedback loops when echoing a message around the network
                     if previously_seen_msg_ids.contains(msg_id) {
                         continue;
                     } else {
@@ -160,26 +159,26 @@ impl NetWatch {
                             continue;
                         }
                     } else {
+                        queued_messages.entry(origin.clone()).or_insert(Vec::new()).push(scm);
+                        pending_whois_requests.insert(origin.clone());
                         debug!("Received a message from unknown peer {} through peer {}. Querying peers for identity of origin.",
                             origin.hex(), peer_id.hex());
-                        queued_messages.entry(origin.clone()).or_insert(Vec::new()).push(scm);
-                        if !pending_whois_requests.contains(&origin) {
-                            pending_whois_requests.insert(origin.clone());
-                            Self::send_to_peers(&mut stream_senders, MessageType::WhoIs, &origin, |peer_id| peer_id != &origin, &error_tx).await;
-                        }
+                        Self::send_to_peers(&mut stream_senders, MessageType::WhoIs, &origin, |peer_id| peer_id != &origin, &error_tx).await;
+
                         continue;
                     }
 
+                    // forwarding capabilities are restricted to known peers
                     if let Some(destination) = scm.destination {
+                        info!("{}, {}", destination.hex(), self.id_service.identity().cert.id.hex());
                         // just in case the previous hop didn't remove the destination if it was destined for us
-                        if scm.destination != Some(self.id_service.identity().cert.id) {
+                        if destination != self.id_service.identity().cert.id {
                             // don't bother reading the message - it's not for us. we should work out where to send it on its way to the destination
-                            let graph = self.graph.read().await;
-                            let path = astar(&*graph, self.id_service.identity().cert.id, |n| n == destination, |(.., w)| w.rtt, |_| 0);
+                            let path = astar(&*self.graph.read().await, self.id_service.identity().cert.id, |n| n == destination, |(.., w)| w.rtt, |_| 0);
                             let next_hop = match path {
                                 Some((est_lat, path)) => {
-                                    debug!("Routing message {}..->{}->{}->{}..{} est. remaining latency ~{}µs",
-                                        origin.hex(), peer_id.hex(), self.id_service.identity().cert.id.hex(), path[1].hex(), destination.hex(), est_lat);
+                                    debug!("Routing message {} {}..->{}->{}->{}..{} est. remaining latency ~{}µs",
+                                        msg_id.hex(), origin.hex(), peer_id.hex(), self.id_service.identity().cert.id.hex(), path[1].hex(), destination.hex(), est_lat);
                                     path[1]
                                 },
                                 None => {
@@ -206,35 +205,14 @@ impl NetWatch {
                         }
                     }
 
-                    let sent_at = LittleEndian::read_i64(&scm.buf.0[0..8]);
-
-                    let mut buf = Vec::with_capacity((&scm.buf.0).len() - 12);
-                    buf.extend_from_slice(&scm.buf.0[12..]);
-
-                    // decompress and realign message to 16-byte boundary
-                    let msg = tokio::task::spawn_blocking(move || {
-                        const INC: usize = 512;
-                        let mut decompressor = Decoder::new(buf.as_slice()).unwrap();
-                        let mut free = INC;
-                        let mut aligned = AlignedVec::with_capacity(free);
-                        aligned.resize(free, 0);
-                        let mut i = 0;
-                        loop {
-                            let read = decompressor.read(&mut aligned[i..]).unwrap();
-                            if read == 0 {
-                                break;
-                            }
-                            free -= read;
-                            i += read;
-                            if free == 0 {
-                                aligned.reserve(INC);
-                                aligned.resize(i + INC, 0);
-                                free = INC;
-                            }
+                    let (sent_at, msg) = match scm.buf.decode().await {
+                        Ok(msg) => msg,
+                        Err(e) => {
+                            warn!("Received a message from peer {} that could not be deserialized. Ignoring. Error: {:?}",
+                                peer_id.hex(), e);
+                            continue;
                         }
-                        aligned.resize(i, 0);
-                        aligned
-                    }).await.unwrap();
+                    };
 
                     match scm.msg_type {
                         MessageType::NewRouter => {
@@ -371,8 +349,7 @@ impl NetWatch {
                                     .expect("netwatch isn't running");
                                 } else {
                                     // we have the identity but no direct connection, so bounce it through our peers
-                                    let graph = self.graph.read().await;
-                                    let path = astar(&*graph, self.id_service.identity().cert.id, |n| n == origin, |(.., w)| w.rtt, |_| 0);
+                                    let path = astar(&*self.graph.read().await, self.id_service.identity().cert.id, |n| n == origin, |(.., w)| w.rtt, |_| 0);
 
                                     let next_hop = match path {
                                         Some((est_lat, path)) => {
@@ -387,25 +364,14 @@ impl NetWatch {
                                         }
                                     };
 
-                                    let sent_at = Utc::now().timestamp_micros();
-                                    let mut msg = compress(to_bytes::<_, 1024>(identity).unwrap().as_ref(), 0).unwrap();
-                                    let len = msg.len() as u32;
-                                    let mut buf = Vec::with_capacity(8 + 4 + msg.len());
-                                    buf.extend_from_slice(&sent_at.to_le_bytes());
-                                    buf.extend_from_slice(&len.to_le_bytes());
-                                    buf.append(&mut msg);
-
-                                    let mut scm = SignedControlMessage {
+                                    let buf = InnerMessageBuf::encode(Utc::now().timestamp_micros(), identity).await;
+                                    let scm = SignedControlMessage {
                                         msg_type: MessageType::ServiceIDMatched,
-                                        buf: InnerMessageBuf(msg),
-                                        sig: self.id_service.sign(&buf),
+                                        sig: self.id_service.sign(&buf.0),
+                                        buf,
                                         forwarded_from_origin: None,
-                                        destination: Some(origin),
+                                        destination: if next_hop == origin { None } else { Some(origin) },
                                     };
-
-                                    if next_hop == origin {
-                                        scm.destination = None;
-                                    }
 
                                     stream_senders
                                         .get_mut(&next_hop)
@@ -502,11 +468,6 @@ impl NetWatch {
         msg_id[4..8].copy_from_slice(&scm.buf.0[12..16]);
         for (peer_id, sender) in stream_senders.iter_mut() {
             if filter(peer_id) {
-                debug!(
-                    "Forwarding SCM {} to peer {}",
-                    msg_id.hex(),
-                    peer_id.hex()
-                );
                 sender
                     .send_scm(scm.clone())
                     .await

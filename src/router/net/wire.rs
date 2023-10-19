@@ -1,6 +1,18 @@
-use kt2::Signature;
+use std::io::Read;
 
-use super::ski::ServiceID;
+use byteorder::{ByteOrder, LittleEndian};
+use kt2::{Signature, SIGN_BYTES};
+use rkyv::{
+    ser::serializers::{
+        AlignedSerializer, AllocScratch, CompositeSerializer, FallbackScratch,
+        HeapScratch, SharedSerializeMap,
+    },
+    to_bytes, AlignedVec, Serialize,
+};
+use tokio::task::spawn_blocking;
+use zstd::{encode_all as compress, Decoder};
+
+use super::{error::Error, ski::ServiceID};
 
 /// Message prefix is 8 bits. The first bit specifies whether the message is
 /// forwarded or not. The second bit specifies whether the message needs to be
@@ -109,6 +121,72 @@ pub type MessageID = [u8; 8];
 #[derive(Clone)]
 pub struct InnerMessageBuf(pub Vec<u8>);
 
+impl InnerMessageBuf {
+    pub async fn decode(&self) -> Result<(i64, AlignedVec), Error> {
+        let sent_at = LittleEndian::read_i64(&self.0[0..8]);
+
+        let mut buf = Vec::with_capacity((&self.0).len() - 12);
+        buf.extend_from_slice(&self.0[12..]);
+
+        // decompress and realign message to 16-byte boundary
+        let msg = spawn_blocking(move || -> Result<AlignedVec, Error> {
+            const INC: usize = 512;
+            let mut decompressor = Decoder::new(buf.as_slice())?;
+            let mut free = INC;
+            let mut aligned = AlignedVec::with_capacity(free);
+            aligned.resize(free, 0);
+            let mut i = 0;
+            loop {
+                let read = decompressor.read(&mut aligned[i..])?;
+                if read == 0 {
+                    break;
+                }
+                free -= read;
+                i += read;
+                if free == 0 {
+                    aligned.reserve(INC);
+                    aligned.resize(i + INC, 0);
+                    free = INC;
+                }
+            }
+            aligned.resize(i, 0);
+            Ok(aligned)
+        })
+        .await
+        .unwrap()?;
+
+        Ok((sent_at, msg))
+    }
+
+    pub async fn encode<T>(sent_at: i64, obj: &T) -> Self
+    where
+        T: Serialize<
+            CompositeSerializer<
+                AlignedSerializer<AlignedVec>,
+                FallbackScratch<HeapScratch<1024>, AllocScratch>,
+                SharedSerializeMap,
+            >,
+        >,
+    {
+        let data = to_bytes::<T, 1024>(obj)
+            .expect("failed to serialize")
+            .as_ref()
+            .to_vec();
+
+        let mut msg = spawn_blocking(move || {
+            compress(data.as_slice(), 0).expect("failed to compress")
+        })
+        .await
+        .unwrap();
+        let len = msg.len() as u32;
+        let mut buf = Vec::with_capacity(8 + 4 + msg.len());
+        buf.extend_from_slice(&sent_at.to_le_bytes());
+        buf.extend_from_slice(&len.to_le_bytes());
+        buf.append(&mut msg);
+        Self(buf)
+    }
+}
+
 /// A partially deconstructed wire message
 #[derive(Clone)]
 pub struct SignedControlMessage {
@@ -124,4 +202,36 @@ pub struct SignedControlMessage {
     /// if `msg_prefix.needs_forwarding()`, the service ID of the router that
     /// should receive this message
     pub destination: Option<ServiceID>,
+}
+
+impl SignedControlMessage {
+    pub fn encode(mut self) -> Vec<u8> {
+        let prefix = MessagePrefix::new(
+            self.forwarded_from_origin.is_some(),
+            self.destination.is_some(),
+            self.msg_type,
+        );
+
+        let mut buf = Vec::with_capacity(
+            1 + self.buf.0.len()
+                + SIGN_BYTES
+                + if self.forwarded_from_origin.is_some() {
+                    4
+                } else {
+                    0
+                }
+                + if self.destination.is_some() { 4 } else { 0 },
+        );
+
+        buf.push(prefix.into()); // 1 byte
+        buf.append(&mut self.buf.0); // sent_at | len | compress(msg)
+        buf.extend_from_slice(&self.sig.0); // SIGN_BYTES bytes
+        if let Some(forwarded_from_origin) = self.forwarded_from_origin {
+            buf.extend_from_slice(&forwarded_from_origin); // 4 bytes
+        }
+        if let Some(destination) = self.destination {
+            buf.extend_from_slice(&destination); // 4 bytes
+        }
+        buf
+    }
 }

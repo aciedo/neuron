@@ -222,6 +222,14 @@ impl Endpoint {
 
         Ok((client_config, server_config))
     }
+
+    pub fn routers(&self) -> Arc<RwLock<HashMap<[u8; 4], ServiceIdentity>>> {
+        self.routers.clone()
+    }
+
+    pub fn network_graph(&self) -> Arc<RwLock<NetworkGraph>> {
+        self.network_graph.clone()
+    }
 }
 
 pub struct NoCertificateVerification {}

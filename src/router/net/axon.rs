@@ -327,35 +327,9 @@ impl ControlSendStream {
 
     pub async fn send_scm(
         &mut self,
-        mut scm: SignedControlMessage,
+        scm: SignedControlMessage,
     ) -> Result<(), Error> {
-        // scm.buf already is sent_at | len | compress(msg)
-        let prefix = MessagePrefix::new(
-            scm.forwarded_from_origin.is_some(),
-            scm.destination.is_some(),
-            scm.msg_type,
-        );
-
-        let mut buf = Vec::with_capacity(
-            1 + scm.buf.0.len()
-                + SIGN_BYTES
-                + if scm.forwarded_from_origin.is_some() {
-                    4
-                } else {
-                    0
-                }
-                + if scm.destination.is_some() { 4 } else { 0 },
-        );
-        buf.push(prefix.into()); // 1 byte
-        buf.append(&mut scm.buf.0); // sent_at | len | compress(msg)
-        buf.extend_from_slice(&scm.sig.0); // SIGN_BYTES bytes
-        if let Some(forwarded_from_origin) = scm.forwarded_from_origin {
-            buf.extend_from_slice(&forwarded_from_origin); // 4 bytes
-        }
-        if let Some(destination) = scm.destination {
-            buf.extend_from_slice(&destination); // 4 bytes
-        }
-        self.stream.write_all(&buf).await?;
+        self.stream.write_all(&scm.encode()).await?;
         Ok(())
     }
 }

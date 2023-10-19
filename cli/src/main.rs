@@ -5,18 +5,21 @@ use std::sync::Arc;
 use blake3::hash;
 use hashbrown::{HashMap, HashSet};
 use kt2::{Keypair, SecretKey};
+use neuron::router::hex::HexDisplayExt;
 use neuron::router::net::endpoint::Endpoint;
 use rkyv::to_bytes;
 
 use neuron::router::net::ski::{
     Certificate, Host, RouterIdentityService, ServiceIdentity,
 };
+use tokio::time::{sleep, Duration};
+use tracing::info;
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    const TOTAL: usize = 7;
+    const TOTAL: usize = 4;
 
     let ca_kp = Keypair::generate(None);
     let ca_pk = ca_kp.public;
@@ -30,22 +33,34 @@ async fn main() {
         .build();
 
     let mut eps = vec![];
-    for i in 1..TOTAL + 1 {
+    for i in 1..TOTAL {
         eps.push(create_ep([127, 0, 0, i as u8], &ca_sk, &root_ca))
     }
 
-    for i in 0..TOTAL {
+    for i in 0..TOTAL - 1 {
         let ep_from = &eps[i];
-        let ip_to = [127, 0, 0, ((i + 1) % TOTAL + 1) as u8];
+        let ip_to = [127, 0, 0, ((i + 1) % (TOTAL - 1) + 1) as u8];
         let addr_to = V4(SocketAddrV4::new(
             Ipv4Addr::new(ip_to[0], ip_to[1], ip_to[2], ip_to[3]),
             471,
         ));
         ep_from
-            .connect(addr_to, &format!("127.0.0.{}", (i + 1) % TOTAL + 1))
+            .connect(addr_to, &format!("127.0.0.{}", (i + 1) % (TOTAL - 1) + 1))
             .await
             .unwrap();
     }
+
+    // Wait for 10 seconds
+    sleep(Duration::from_secs(15)).await;
+
+    // Add the final endpoint and connect it to the first
+    let final_endpoint = create_ep([127, 0, 0, TOTAL as u8], &ca_sk, &root_ca);
+    let ip_to = [127, 0, 0, 1];
+    let addr_to = V4(SocketAddrV4::new(
+        Ipv4Addr::new(ip_to[0], ip_to[1], ip_to[2], ip_to[3]),
+        471,
+    ));
+    final_endpoint.connect(addr_to, "127.0.0.1").await.unwrap();
 
     loop {}
 }
@@ -70,6 +85,7 @@ fn create_ep(
         cert: cert.clone(),
         signature: ca_sk.sign(&to_bytes::<_, 1024>(&cert).unwrap()),
     };
+    info!("Creating endpoint for {}", identity.cert.id.hex());
     let id_service = Arc::new(
         RouterIdentityService::new(identity, secret, (*root_ca).clone())
             .unwrap(),
