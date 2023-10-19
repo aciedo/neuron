@@ -7,6 +7,7 @@ use hashbrown::{HashMap, HashSet};
 use kt2::{Keypair, SecretKey};
 use neuron::router::hex::HexDisplayExt;
 use neuron::router::net::endpoint::Endpoint;
+use neuron::router::net::geo::Location;
 use rkyv::to_bytes;
 
 use neuron::router::net::ski::{
@@ -19,17 +20,22 @@ use tracing::info;
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    const TOTAL: usize = 4;
+    const TOTAL: usize = 7;
 
     let ca_kp = Keypair::generate(None);
     let ca_pk = ca_kp.public;
     let ca_sk = ca_kp.secret;
     let root_ca = Certificate::builder()
-        .hosts(HashMap::new())
         .human_readable_name("root-ca".into())
         .id(hash(&ca_pk.bytes).as_bytes()[0..4].try_into().unwrap())
         .public_key(ca_pk)
-        .tags(vec![])
+        .location(Location::from(0.0, 0.0))
+        .hosts(HashMap::new())
+        .tags({
+            let mut set = HashSet::new();
+            set.insert("ca".into());
+            set
+        })
         .build();
 
     let mut eps = vec![];
@@ -74,11 +80,16 @@ fn create_ep(
     hosts.insert(Host::IPv4(ip.clone()), HashSet::new());
     let Keypair { public, secret } = Keypair::generate(None);
     let cert = Certificate::builder()
-        .hosts(hosts)
         .human_readable_name(ip.map(|byte| byte.to_string()).join("."))
         .id(hash(&public.bytes).as_bytes()[0..4].try_into().unwrap())
         .public_key(public)
-        .tags(vec![])
+        .location(Location::from(0.0, 0.0))
+        .hosts(hosts)
+        .tags({
+            let mut set = HashSet::new();
+            set.insert("neuron-router".into());
+            set
+        })
         .build();
     println!("{}", cert);
     let identity = ServiceIdentity {

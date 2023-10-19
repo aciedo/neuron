@@ -21,7 +21,7 @@ use tokio::{
     select,
     sync::{mpsc, RwLock},
 };
-use tracing::{debug, debug_span, info, trace, warn};
+use tracing::{debug, debug_span, trace, warn};
 
 use crate::router::{hex::HexDisplayExt, net::endpoint::LatencyEdge};
 use rkyv::from_bytes;
@@ -170,7 +170,6 @@ impl NetWatch {
 
                     // forwarding capabilities are restricted to known peers
                     if let Some(destination) = scm.destination {
-                        info!("{}, {}", destination.hex(), self.id_service.identity().cert.id.hex());
                         // just in case the previous hop didn't remove the destination if it was destined for us
                         if destination != self.id_service.identity().cert.id {
                             // don't bother reading the message - it's not for us. we should work out where to send it on its way to the destination
@@ -231,6 +230,11 @@ impl NetWatch {
                             }
                             if !identity.cert.validate_self_id() {
                                 warn!("Received a NewRouter message from peer {} for peer {} whose ID didn't match its public key. Ignoring.",
+                                    peer_id.hex(), identity.cert.id.hex());
+                                continue;
+                            }
+                            if !identity.cert.contains_all_tags(&["neuron-router".into()]) {
+                                warn!("Received a NewRouter message from peer {} for peer {} that didn't have the neuron-router tag. Ignoring.",
                                     peer_id.hex(), identity.cert.id.hex());
                                 continue;
                             }
@@ -403,6 +407,11 @@ impl NetWatch {
                             if pending_whois_requests.remove(&identity.cert.id) {
                                 if !identity.cert.validate_self_id() {
                                     warn!("Received a ServiceIDMatched message from peer {} for peer {} whose ID didn't match its public key. Ignoring.",
+                                        peer_id.hex(), identity.cert.id.hex());
+                                    continue;
+                                }
+                                if !identity.cert.contains_all_tags(&["neuron-router".into()]) {
+                                    warn!("Received a ServiceIDMatched message from peer {} for peer {} that didn't have the neuron-router tag. Ignoring.",
                                         peer_id.hex(), identity.cert.id.hex());
                                     continue;
                                 }

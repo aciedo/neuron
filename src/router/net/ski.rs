@@ -21,6 +21,8 @@ use std::net::SocketAddr;
 
 use crate::router::hex::HexDisplayExt;
 
+use super::geo::Location;
+
 /// The identity service stores a read-only, global copy of SKI's setup,
 /// including the network's root certificate authority and router's key and
 /// certificate.
@@ -87,20 +89,22 @@ impl RouterIdentityService {
 #[derive(Archive, Serialize, Deserialize, TypedBuilder, Clone)]
 #[archive(check_bytes)]
 pub struct Certificate {
-    /// A list of hosts that this certificate is valid for with optional ports.
-    /// If a port isn't given, this certificate is valid for all ports on that
-    /// host.
-    pub hosts: HashMap<Host, HashSet<u16>>,
     /// The human readable name of the certificate.
     pub human_readable_name: String,
     /// A deterministic ID for the certificate based on the public key.
     pub id: ServiceID,
     /// The public key of the certificate.
     pub public_key: PublicKey,
+    /// The approximate physical location of the service.
+    pub location: Location,
+    /// A list of hosts that this certificate is valid for with optional ports.
+    /// If a port isn't given, this certificate is valid for all ports on that
+    /// host.
+    pub hosts: HashMap<Host, HashSet<u16>>,
     /// A list of tags that this certificate is valid for. These will usually
     /// contain the purpose of the certificate and is used for selectively
     /// enabling permissions for a remote service.
-    pub tags: Vec<String>,
+    pub tags: HashSet<String>,
 }
 
 impl std::fmt::Display for Certificate {
