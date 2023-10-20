@@ -1,5 +1,9 @@
-use std::io::Read;
+use std::{
+    hash::{BuildHasher, Hasher},
+    io::Read,
+};
 
+use ahash::RandomState;
 use byteorder::{ByteOrder, LittleEndian};
 use kt2::{Signature, SIGN_BYTES};
 use rkyv::{
@@ -30,35 +34,31 @@ pub struct MessagePrefix(u8);
 
 impl MessagePrefix {
     pub fn new(
-        forwarded: bool,
-        needs_forwarding: bool,
+        has_origin: bool,
+        has_destination: bool,
         msg_type: MessageType,
     ) -> Self {
         let mut prefix = 0b0000_0000;
-        if forwarded {
+        if has_origin {
             prefix |= 0b1000_0000;
         }
-        if needs_forwarding {
+        if has_destination {
             prefix |= 0b0100_0000;
         }
         prefix |= msg_type as u8;
         Self(prefix)
     }
 
-    pub fn forwarded(&self) -> bool {
+    pub fn has_origin(&self) -> bool {
         self.0 & 0b1000_0000 != 0
     }
 
-    pub fn needs_forwarding(&self) -> bool {
+    pub fn has_destination(&self) -> bool {
         self.0 & 0b0100_0000 != 0
     }
 
     pub fn msg_type(&self) -> MessageType {
         MessageType::try_from(self.0 & 0b0011_1111).unwrap()
-    }
-
-    pub fn byte(&self) -> u8 {
-        self.0
     }
 }
 
@@ -115,7 +115,7 @@ impl TryFrom<u8> for MessageType {
     }
 }
 
-pub type MessageID = [u8; 8];
+pub type MessageID = u64;
 
 /// A buffer containing a sent_at | len | compress(msg) concatenation
 #[derive(Clone)]
@@ -185,6 +185,12 @@ impl InnerMessageBuf {
         buf.append(&mut msg);
         Self(buf)
     }
+
+    pub fn id(&self, hash_factory: &RandomState) -> MessageID {
+        let mut hasher = hash_factory.build_hasher();
+        hasher.write(&self.0);
+        hasher.finish()
+    }
 }
 
 /// A partially deconstructed wire message
@@ -198,7 +204,7 @@ pub struct SignedControlMessage {
     pub sig: Signature,
     /// if `msg_prefix.forwarded()`, the service ID of the router that
     /// created this message
-    pub forwarded_from_origin: Option<ServiceID>,
+    pub origin: Option<ServiceID>,
     /// if `msg_prefix.needs_forwarding()`, the service ID of the router that
     /// should receive this message
     pub destination: Option<ServiceID>,
@@ -207,7 +213,7 @@ pub struct SignedControlMessage {
 impl SignedControlMessage {
     pub fn encode(mut self) -> Vec<u8> {
         let prefix = MessagePrefix::new(
-            self.forwarded_from_origin.is_some(),
+            self.origin.is_some(),
             self.destination.is_some(),
             self.msg_type,
         );
@@ -215,18 +221,14 @@ impl SignedControlMessage {
         let mut buf = Vec::with_capacity(
             1 + self.buf.0.len()
                 + SIGN_BYTES
-                + if self.forwarded_from_origin.is_some() {
-                    4
-                } else {
-                    0
-                }
+                + if self.origin.is_some() { 4 } else { 0 }
                 + if self.destination.is_some() { 4 } else { 0 },
         );
 
         buf.push(prefix.into()); // 1 byte
         buf.append(&mut self.buf.0); // sent_at | len | compress(msg)
         buf.extend_from_slice(&self.sig.0); // SIGN_BYTES bytes
-        if let Some(forwarded_from_origin) = self.forwarded_from_origin {
+        if let Some(forwarded_from_origin) = self.origin {
             buf.extend_from_slice(&forwarded_from_origin); // 4 bytes
         }
         if let Some(destination) = self.destination {

@@ -13,7 +13,7 @@ use quinn_proto::{IdleTimeout, VarInt};
 use rustls::client::{ServerCertVerified, ServerCertVerifier};
 
 use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, debug_span, Instrument};
+use tracing::debug;
 
 use crate::router::hex::HexDisplayExt;
 

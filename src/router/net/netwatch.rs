@@ -1,4 +1,6 @@
 use crate::router::net::wire::InnerMessageBuf;
+use ahash::RandomState;
+use futures::future::join_all;
 use petgraph::algo::astar;
 use std::{
     cmp::Reverse,
@@ -21,7 +23,7 @@ use tokio::{
     select,
     sync::{mpsc, RwLock},
 };
-use tracing::{debug, debug_span, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::router::{hex::HexDisplayExt, net::endpoint::LatencyEdge};
 use rkyv::from_bytes;
@@ -53,8 +55,6 @@ impl NetWatch {
         &self,
         mut new_control_channels_rx: mpsc::UnboundedReceiver<NewControlStream>,
     ) {
-        let span = debug_span!("netwatch");
-        let _guard = span.enter();
         debug!("netwatch started");
         let (new_msg_tx, mut new_msg_rx) = mpsc::unbounded_channel();
         let (rtt_tx, mut rtt_rx) = mpsc::unbounded_channel();
@@ -69,6 +69,7 @@ impl NetWatch {
             HashMap::new();
 
         let mut previously_seen_msg_ids = ExpiringSet::new();
+        let hasher_factory = RandomState::new();
         loop {
             // dequeue any pending messages we can now process
             for id in queued_messages
@@ -109,7 +110,6 @@ impl NetWatch {
                                     };
                                 }
                                 _ = rtt_interval.tick() => {
-                                    debug!("sending axon rtt {:?} for peer {}", axon.conn().rtt(), peer_id.hex());
                                     rtt_tx.send((peer_id, axon.conn().rtt())).expect("netwatch isn't running");
                                 }
                             }
@@ -124,23 +124,19 @@ impl NetWatch {
                     });
                     Self::send_to_peers(&mut stream_senders, MessageType::Rtt, &(peer_id, rtt.as_micros()), |_| true, &error_tx).await;
                 }
-                Some((peer_id, mut scm)) = new_msg_rx.recv() => {
-                    let mut msg_id = [0u8; 8];
-                    msg_id[0..4].copy_from_slice(&scm.buf.0[0..4]);
-                    msg_id[4..8].copy_from_slice(&scm.buf.0[12..16]);
-                    // it's often for us to receive the same message multiple times.
+                Some((from_id, mut scm)) = new_msg_rx.recv() => {
+                    let msg_id = scm.buf.id(&hasher_factory);
+                    // it's likely we'll receive the same message multiple times.
                     // this removes any feedback loops when echoing a message around the network
-                    if previously_seen_msg_ids.contains(msg_id) {
+                    if !previously_seen_msg_ids.insert(msg_id, Duration::from_secs(300)) {
                         continue;
-                    } else {
-                        previously_seen_msg_ids.insert(msg_id, Duration::from_secs(300));
                     }
 
                     // the origin is the peer that created the message
                     // it might be different from the peer that forwarded it to us
-                    let origin = match scm.forwarded_from_origin {
-                        Some(originator) => originator,
-                        None => peer_id.clone(),
+                    let origin = match scm.origin {
+                        Some(origin) => origin,
+                        None => from_id.clone(),
                     };
 
                     // ignore messages looped back to us
@@ -150,19 +146,13 @@ impl NetWatch {
 
                     if let Some(identity) = self.routers.read().await.get(&origin) {
                         if !identity.cert.public_key.verify(&scm.buf.0, &scm.sig) {
-                            if origin == peer_id {
-                                warn!("Received bad signature for a message from peer {}. Ignoring.", origin.hex());
-                            } else {
-                                warn!("Received bad signature for a message from peer {} through peer {}. Ignoring.",
-                                    origin.hex(), peer_id.hex());
-                            }
+                            warn!("BAD SIG ORIGIN {}. IGNORE", origin.hex());
                             continue;
                         }
                     } else {
                         queued_messages.entry(origin.clone()).or_insert(Vec::new()).push(scm);
                         pending_whois_requests.insert(origin.clone());
-                        debug!("Received a message from unknown peer {} through peer {}. Querying peers for identity of origin.",
-                            origin.hex(), peer_id.hex());
+                        debug!("UNKNOWN PEER {}. QUERYING PEERS", origin.hex());
                         Self::send_to_peers(&mut stream_senders, MessageType::WhoIs, &origin, |peer_id| peer_id != &origin, &error_tx).await;
 
                         continue;
@@ -176,13 +166,13 @@ impl NetWatch {
                             let path = astar(&*self.graph.read().await, self.id_service.identity().cert.id, |n| n == destination, |(.., w)| w.rtt, |_| 0);
                             let next_hop = match path {
                                 Some((est_lat, path)) => {
-                                    debug!("Routing message {} {}..->{}->{}->{}..{} est. remaining latency ~{}µs",
-                                        msg_id.hex(), origin.hex(), peer_id.hex(), self.id_service.identity().cert.id.hex(), path[1].hex(), destination.hex(), est_lat);
+                                    debug!("ROUTE MSG.{}  PATH: ORIGIN {} .. -> FROM {} -> ME {} -> NEXT {} .. DEST {}  ETA: T+{}µs",
+                                        msg_id.to_le_bytes().hex(), origin.hex(), from_id.hex(), self.id_service.identity().cert.id.hex(), path[1].hex(), destination.hex(), est_lat);
                                     path[1]
                                 },
                                 None => {
-                                    warn!("No route to destination {} for message {}..->{}->{}..{}",
-                                        destination.hex(), origin.hex(), peer_id.hex(), self.id_service.identity().cert.id.hex(), destination.hex());
+                                    debug!("NO ROUTE MSG.{}  PATH: ORIGIN {} .. -> FROM {} -> ME {} -> NEXT ??? .. DEST {}",
+                                        msg_id.to_le_bytes().hex(), origin.hex(), from_id.hex(), self.id_service.identity().cert.id.hex(), destination.hex());
                                     continue;
                                 }
                             };
@@ -191,8 +181,8 @@ impl NetWatch {
                                 scm.destination = None;
                             }
 
-                            if scm.forwarded_from_origin.is_none() {
-                                scm.forwarded_from_origin = Some(origin);
+                            if scm.origin.is_none() {
+                                scm.origin = Some(origin);
                             }
 
                             stream_senders
@@ -207,8 +197,8 @@ impl NetWatch {
                     let (sent_at, msg) = match scm.buf.decode().await {
                         Ok(msg) => msg,
                         Err(e) => {
-                            warn!("Received a message from peer {} that could not be deserialized. Ignoring. Error: {:?}",
-                                peer_id.hex(), e);
+                            warn!("DECODE FROM {} ERR: {:?}",
+                                from_id.hex(), e);
                             continue;
                         }
                     };
@@ -218,29 +208,27 @@ impl NetWatch {
                             let identity: ServiceIdentity = match from_bytes(&msg).ok() {
                                 Some(identity) => identity,
                                 None => {
-                                    warn!("Received a NewRouter message from peer {} that could not be deserialized. Ignoring.",
-                                        peer_id.hex());
+                                    warn!("DECODE NewRouter ORIGIN {} FAIL. IGNORE",
+                                        origin.hex());
                                     continue;
                                 }
                             };
                             if self.routers.read().await.contains_key(&identity.cert.id) {
-                                warn!("Received a NewRouter message from peer {} for peer {} that we already know about. Ignoring.",
-                                    peer_id.hex(), identity.cert.id.hex());
                                 continue;
                             }
                             if !identity.cert.validate_self_id() {
-                                warn!("Received a NewRouter message from peer {} for peer {} whose ID didn't match its public key. Ignoring.",
-                                    peer_id.hex(), identity.cert.id.hex());
+                                warn!("ID ERR NewRouter ORIGIN {} FOR {}. IGNORE",
+                                    origin.hex(), identity.cert.id.hex());
                                 continue;
                             }
                             if !identity.cert.contains_all_tags(&["neuron-router".into()]) {
-                                warn!("Received a NewRouter message from peer {} for peer {} that didn't have the neuron-router tag. Ignoring.",
-                                    peer_id.hex(), identity.cert.id.hex());
+                                warn!("TAG ERR NewRouter ORIGIN {} FOR {}. IGNORE",
+                                    origin.hex(), identity.cert.id.hex());
                                 continue;
                             }
-                            if self.id_service.validate_identity_against_ca(&identity) {
-                                warn!("Received a NewRouter message from peer {} for peer {} that wasn't signed by our root CA. Ignoring.",
-                                    peer_id.hex(), identity.cert.id.hex());
+                            if !self.id_service.validate_identity_against_ca(&identity) {
+                                warn!("SIG ERR NewRouter ORIGIN {} FOR {}. IGNORE",
+                                    origin.hex(), identity.cert.id.hex());
                                 continue;
                             }
 
@@ -256,15 +244,15 @@ impl NetWatch {
                                 },
                             );
 
-                            debug!("Added new router {} from peer {}", identity.cert.id.hex(), peer_id.hex());
-                            Self::fwd_scm(&mut stream_senders, scm, |id| id != &origin && id != &peer_id, &error_tx).await;
+                            info!("NEW ROUTER {} ORIGIN {}", identity.cert.id.hex(), origin.hex());
+                            Self::fwd_scm(&mut stream_senders, scm, |id| id != &origin && id != &from_id, &error_tx).await;
                         },
                         MessageType::DeadRouter => {
                             let id: ServiceID = match from_bytes(&msg).ok() {
                                 Some(id) => id,
                                 None => {
-                                    warn!("Received a DeadRouter message from peer {} that could not be deserialized. Ignoring.",
-                                        peer_id.hex());
+                                    warn!("DECODE DeadRouter ORIGIN {} FAIL. IGNORE",
+                                        origin.hex());
                                     continue;
                                 }
                             };
@@ -279,23 +267,23 @@ impl NetWatch {
                             stream_senders.remove(&id);
                             pending_whois_requests.remove(&id);
                             queued_messages.remove(&id);
-                            debug!("Removed dead router {}", id.hex());
-                            Self::fwd_scm(&mut stream_senders, scm, |id| id != &origin && id != &peer_id, &error_tx).await;
+                            debug!("DEAD {}", id.hex());
+                            Self::fwd_scm(&mut stream_senders, scm, |id| id != &origin && id != &from_id, &error_tx).await;
                         },
                         MessageType::Rtt => {
                             let (target, new_rtt) = match from_bytes(&msg).ok() {
                                 Some(o) => o,
                                 None => {
-                                    warn!("Received an RTT message from peer {} that could not be deserialized. Ignoring.",
-                                        peer_id.hex());
+                                    warn!("DECODE Rtt ORIGIN {} FAIL. IGNORE",
+                                        origin.hex());
                                     continue;
                                 }
                             };
                             let timestamp = Utc.from_utc_datetime(&match NaiveDateTime::from_timestamp_micros(sent_at) {
                                 Some(a) => a,
                                 None => {
-                                    warn!("Received an RTT message from peer {} with an invalid timestamp. Ignoring.",
-                                        peer_id.hex());
+                                    warn!("BAD TIME Rtt ORIGIN {}. IGNORE",
+                                        origin.hex());
                                     continue;
                                 }
                             });
@@ -314,28 +302,28 @@ impl NetWatch {
                             };
 
                             if let Some(old_edge) = graph.add_edge(origin, target, new_edge.clone()) {
-                                trace!("Update RTT {} -> {} from {}µs to {}µs",
+                                trace!("UPDATED RTT {} -> {}  {}µs -> {}µs",
                                     origin.hex(), target.hex(), old_edge.rtt, new_edge.rtt);
                             } else {
-                                trace!("Added RTT {} -> {} of {}µs",
+                                trace!("ADDED RTT {} -> {} {}µs",
                                      origin.hex(), target.hex(), new_edge.rtt);
                             }
                             drop(graph);
-                            trace!("Forwarding RTT message {} from {} to other peers",
-                               msg_id.hex(), origin.hex());
+                            trace!("FORWARD RTT MSG.{} ORIGIN {}",
+                               msg_id.to_le_bytes().hex(), origin.hex());
 
-                            if scm.forwarded_from_origin.is_none() {
-                                scm.forwarded_from_origin = Some(origin);
+                            if scm.origin.is_none() {
+                                scm.origin = Some(origin);
                             }
 
-                            Self::fwd_scm(&mut stream_senders, scm, |id| id != &origin && id != &peer_id, &error_tx).await;
+                            Self::fwd_scm(&mut stream_senders, scm, |id| id != &origin && id != &from_id, &error_tx).await;
                         },
                         MessageType::WhoIs => {
                             let whois_id: ServiceID = match from_bytes(&msg).ok() {
                                 Some(id) => id,
                                 None => {
-                                    warn!("Received a WhoIs message from peer {} that could not be deserialized. Ignoring.",
-                                        peer_id.hex());
+                                    warn!("DECODE WhoIs ORIGIN {} FAIL. IGNORE",
+                                        origin.hex());
                                     continue;
                                 }
                             };
@@ -357,12 +345,12 @@ impl NetWatch {
 
                                     let next_hop = match path {
                                         Some((est_lat, path)) => {
-                                            trace!("Sending ServiceIDMatched message for {} through {}->{}..{} est. remaining latency ~{}µs",
+                                            trace!("SEND ServiceIDMatched FOR {}  PATH: ME {} -> NEXT {} .. DEST {}  ETA: T+{}µs",
                                                 whois_id.hex(), self.id_service.identity().cert.id.hex(), path[1].hex(), origin.hex(), est_lat);
                                             path[1]
                                         },
                                         None => {
-                                            warn!("No route to respond with ServiceIDMatched message for peer {} from peer {}",
+                                            warn!("NO ROUTE ServiceIDMatched FOR {} DEST {}",
                                                 whois_id.hex(), origin.hex());
                                             continue;
                                         }
@@ -373,7 +361,7 @@ impl NetWatch {
                                         msg_type: MessageType::ServiceIDMatched,
                                         sig: self.id_service.sign(&buf.0),
                                         buf,
-                                        forwarded_from_origin: None,
+                                        origin: None,
                                         destination: if next_hop == origin { None } else { Some(origin) },
                                     };
 
@@ -384,44 +372,42 @@ impl NetWatch {
                                         .await.expect("netwatch isn't running");
                                     continue;
                                 }
-                                debug!("Sent identity of peer {} to peer {}", whois_id.hex(), origin.hex());
+                                debug!("SENT ServiceIDMatched FOR {} DEST {}", whois_id.hex(), origin.hex());
                             } else {
                                 // otherwise, forward the WhoIs message to all peers except the origin and the peer that sent it
-                                if scm.forwarded_from_origin.is_none() {
-                                    scm.forwarded_from_origin = Some(origin);
+                                if scm.origin.is_none() {
+                                    scm.origin = Some(origin);
                                 }
-                                Self::fwd_scm(&mut stream_senders, scm, |id| id != &origin && id != &peer_id, &error_tx).await;
-                                debug!("Forwarded WhoIs message for peer {} from peer {} to all other peers",
-                                    whois_id.hex(), origin.hex());
+                                Self::fwd_scm(&mut stream_senders, scm, |id| id != &origin && id != &from_id, &error_tx).await;
+                                debug!("FWD WhoIs FOR {} DEST {}", whois_id.hex(), origin.hex());
                             }
                         },
                         MessageType::ServiceIDMatched => {
                             let identity: ServiceIdentity = match from_bytes(&msg).ok() {
                                 Some(id) => id,
                                 None => {
-                                    warn!("Received a ServiceIDMatched message from peer {} that could not be deserialized. Ignoring.",
-                                        peer_id.hex());
+                                    warn!("DECODE ServiceIDMatched ORIGIN {} FAIL. IGNORE",
+                                        origin.hex());
                                     continue;
                                 }
                             };
                             if pending_whois_requests.remove(&identity.cert.id) {
                                 if !identity.cert.validate_self_id() {
-                                    warn!("Received a ServiceIDMatched message from peer {} for peer {} whose ID didn't match its public key. Ignoring.",
-                                        peer_id.hex(), identity.cert.id.hex());
+                                    warn!("ID ERR ServiceIDMatched ORIGIN {} FOR {}. IGNORE",
+                                        origin.hex(), identity.cert.id.hex());
                                     continue;
                                 }
                                 if !identity.cert.contains_all_tags(&["neuron-router".into()]) {
-                                    warn!("Received a ServiceIDMatched message from peer {} for peer {} that didn't have the neuron-router tag. Ignoring.",
-                                        peer_id.hex(), identity.cert.id.hex());
+                                    warn!("TAG ERR ServiceIDMatched ORIGIN {} FOR {}. IGNORE",
+                                        origin.hex(), identity.cert.id.hex());
                                     continue;
                                 }
                                 if !self.id_service.validate_identity_against_ca(&identity) {
-                                    warn!("Received a ServiceIDMatched message from peer {} for peer {} that wasn't signed by our root CA. Ignoring.",
-                                        peer_id.hex(), identity.cert.id.hex());
+                                    warn!("SIG ERR ServiceIDMatched ORIGIN {} FOR {}. IGNORE",
+                                        origin.hex(), identity.cert.id.hex());
                                     continue;
                                 }
-                                debug!("Received an identity from peer {} for peer {}",
-                                    peer_id.hex(), identity.cert.id.hex());
+                                info!("ID MATCH FOR {} ORIGIN {}", identity.cert.id.hex(), origin.hex());
                                 self.routers.write().await.insert(identity.cert.id, identity);
                             }
                         },
@@ -452,15 +438,20 @@ impl NetWatch {
             >,
         >,
     {
+        let mut active_sends = Vec::new();
         for (peer_id, sender) in stream_senders.iter_mut() {
             if filter(peer_id) {
-                sender
-                    .send(msg_type.clone(), msg)
-                    .await
-                    .or_else(|e| error_tx.send((*peer_id, e)))
-                    .expect("netwatch isn't running");
+                let msg_type = msg_type.clone();
+                active_sends.push(async move {
+                    sender
+                        .send(msg_type, msg)
+                        .await
+                        .or_else(|e| error_tx.send((*peer_id, e)))
+                        .expect("netwatch isn't running");
+                })
             }
         }
+        join_all(active_sends).await;
     }
 
     /// Sends a SCM to all peers based on a filter.
@@ -472,18 +463,21 @@ impl NetWatch {
     ) where
         F: Fn(&ServiceID) -> bool,
     {
-        let mut msg_id = [0u8; 8];
-        msg_id[0..4].copy_from_slice(&scm.buf.0[0..4]);
-        msg_id[4..8].copy_from_slice(&scm.buf.0[12..16]);
+        let mut active_sends = Vec::new();
         for (peer_id, sender) in stream_senders.iter_mut() {
             if filter(peer_id) {
-                sender
-                    .send_scm(scm.clone())
-                    .await
-                    .or_else(|e| error_tx.send((*peer_id, e)))
-                    .expect("netwatch isn't running");
+                let scm = scm.clone();
+                let error_tx = error_tx.clone();
+                active_sends.push(async move {
+                    sender
+                        .send_scm(scm)
+                        .await
+                        .or_else(|e| error_tx.send((*peer_id, e)))
+                        .expect("netwatch isn't running");
+                })
             }
         }
+        join_all(active_sends).await;
     }
 
     pub fn graph(
@@ -513,16 +507,19 @@ impl ExpiringSet {
         }
     }
 
-    fn insert(&mut self, value: MessageID, ttl: Duration) {
+    /// Inserts a message ID into the set, returning true if it was not already
+    /// present.
+    fn insert(&mut self, value: MessageID, ttl: Duration) -> bool {
         let expiry = SystemTime::now() + ttl;
-        self.set.insert(value);
-        self.queue.push((Reverse(expiry), value));
+        if self.set.insert(value) {
+            self.queue.push((Reverse(expiry), value));
+            true
+        } else {
+            false
+        }
     }
 
-    fn contains(&self, value: MessageID) -> bool {
-        self.set.contains(&value)
-    }
-
+    /// Removes expired entries from the set.
     fn remove_expired(&mut self) {
         let now = SystemTime::now();
         while self

@@ -356,13 +356,13 @@ impl ControlRecvStream {
             .ok_or(MessageLengthOverflowed)?
             as usize;
 
-        if prefix.forwarded() {
+        if prefix.has_origin() {
             len_to_read =
                 len_to_read.checked_add(4).ok_or(MessageLengthOverflowed)?
                     as usize;
         }
 
-        if prefix.needs_forwarding() {
+        if prefix.has_destination() {
             len_to_read =
                 len_to_read.checked_add(4).ok_or(MessageLengthOverflowed)?
                     as usize;
@@ -375,17 +375,17 @@ impl ControlRecvStream {
         let sig_and_maybe_sid = buf.split_off(8 + 4 + msg_len as usize);
         let sig = Signature(*array_ref![sig_and_maybe_sid, 0, SIGN_BYTES]);
 
-        if prefix.forwarded() {
+        if prefix.has_origin() {
             let forwarded_from_origin =
                 array_ref![sig_and_maybe_sid, SIGN_BYTES, 4];
-            if prefix.needs_forwarding() {
+            if prefix.has_destination() {
                 // message was forwarded, and needs to be forwarded again
                 let destination =
                     array_ref![sig_and_maybe_sid, SIGN_BYTES + 4, 4];
                 return Ok(SignedControlMessage {
                     buf: InnerMessageBuf(buf),
                     sig,
-                    forwarded_from_origin: Some(*forwarded_from_origin),
+                    origin: Some(*forwarded_from_origin),
                     destination: Some(*destination),
                     msg_type: prefix.msg_type(),
                 });
@@ -394,18 +394,18 @@ impl ControlRecvStream {
                 return Ok(SignedControlMessage {
                     buf: InnerMessageBuf(buf),
                     sig,
-                    forwarded_from_origin: Some(*forwarded_from_origin),
+                    origin: Some(*forwarded_from_origin),
                     destination: None,
                     msg_type: prefix.msg_type(),
                 });
             }
-        } else if prefix.needs_forwarding() {
+        } else if prefix.has_destination() {
             let destination = array_ref![sig_and_maybe_sid, SIGN_BYTES, 4];
             // message was sent directly to us and needs to be forwarded
             return Ok(SignedControlMessage {
                 buf: InnerMessageBuf(buf),
                 sig,
-                forwarded_from_origin: None,
+                origin: None,
                 destination: Some(*destination),
                 msg_type: prefix.msg_type(),
             });
@@ -414,7 +414,7 @@ impl ControlRecvStream {
             return Ok(SignedControlMessage {
                 buf: InnerMessageBuf(buf),
                 sig,
-                forwarded_from_origin: None,
+                origin: None,
                 destination: None,
                 msg_type: prefix.msg_type(),
             });

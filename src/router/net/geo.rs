@@ -5,7 +5,7 @@ use std::f64::consts::PI;
 use std::fmt;
 use std::ops::{Add, Mul, Sub};
 
-pub const RADIUS_OF_EARTH: Distance = Distance {
+pub const BIG_BLUE_SPHERE_DIAMETER: Distance = Distance {
     unit: DistanceUnit::Kilometers,
     value: 6378.137,
 };
@@ -47,11 +47,11 @@ impl Location {
 
         let c = 2. * atan2(a.sqrt(), (1. - a).sqrt());
 
-        RADIUS_OF_EARTH * c
+        BIG_BLUE_SPHERE_DIAMETER * c
     }
 
     pub fn add(&self, distance: &Distance, direction: Direction) -> Self {
-        let d = distance.kilometers() / RADIUS_OF_EARTH.kilometers();
+        let d = distance.kilometers() / BIG_BLUE_SPHERE_DIAMETER.kilometers();
         let c = 180. / PI;
 
         match direction {
