@@ -166,8 +166,8 @@ impl NetWatch {
                             let path = astar(&*self.graph.read().await, self.id_service.identity().cert.id, |n| n == destination, |(.., w)| w.rtt, |_| 0);
                             let next_hop = match path {
                                 Some((est_lat, path)) => {
-                                    debug!("ROUTE MSG.{}  PATH: ORIGIN {} .. -> FROM {} -> ME {} -> NEXT {} .. DEST {}  ETA: T+{}µs",
-                                        msg_id.to_le_bytes().hex(), origin.hex(), from_id.hex(), self.id_service.identity().cert.id.hex(), path[1].hex(), destination.hex(), est_lat);
+                                    debug!("ROUTE MSG.{}  PATH ({} left): ORIGIN {} .. -> FROM {} -> ME {} -> NEXT {} .. DEST {}  ETA: T+{}µs",
+                                        msg_id.to_le_bytes().hex(), path.len() -1, origin.hex(), from_id.hex(), self.id_service.identity().cert.id.hex(), path[1].hex(), destination.hex(), est_lat);
                                     path[1]
                                 },
                                 None => {
